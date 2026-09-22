@@ -683,20 +683,130 @@ def generate_thumbnail_with_text(prompt: str, title_text: str, output_path: str)
 # ==============================================================================
 # 7. YouTube Upload & Comment Automation Prompt
 # ==============================================================================
+YOUTUBE_TOKEN_FILE = os.getenv("YOUTUBE_TOKEN_FILE", "token.pickle")
+
+# Headless-friendly client config (works on HF Spaces / servers without a browser).
+# Supports client_secrets.json OR GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET env vars.
+_GOOGLE_AUTH_CONFIG = {
+    "installed": {
+        "client_id": os.getenv("GOOGLE_CLIENT_ID", ""),
+        "client_secret": os.getenv("GOOGLE_CLIENT_SECRET", ""),
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "redirect_uris": ["http://localhost"],
+    }
+}
+
+_HEADLESS_FLOW = None
+
+
+def _load_auth_flow():
+    """Build an InstalledAppFlow from client_secrets.json or env vars."""
+    if os.path.exists("client_secrets.json"):
+        return InstalledAppFlow.from_client_secrets_file("client_secrets.json", YOUTUBE_SCOPES)
+    if _GOOGLE_AUTH_CONFIG["installed"]["client_id"] and _GOOGLE_AUTH_CONFIG["installed"]["client_secret"]:
+        return InstalledAppFlow.from_client_config(_GOOGLE_AUTH_CONFIG, scopes=YOUTUBE_SCOPES)
+    raise FileNotFoundError(
+        "Google OAuth setup missing. Provide client_secrets.json OR set "
+        "GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET environment variables."
+    )
+
+
+def get_cached_youtube_credentials():
+    """Load saved YouTube credentials (token.pickle), refreshing if expired."""
+    import pickle
+    from google.oauth2.credentials import Credentials as _UnusedCreds  # noqa: F401 (ensures google-auth present)
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+
+    if not os.path.exists(YOUTUBE_TOKEN_FILE):
+        return None
+    try:
+        with open(YOUTUBE_TOKEN_FILE, "rb") as f:
+            creds = pickle.load(f)
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(GoogleAuthRequest())
+                with open(YOUTUBE_TOKEN_FILE, "wb") as f:
+                    pickle.dump(creds, f)
+            except Exception as e:
+                logger.warning(f"Credential refresh failed (re-auth needed): {e}")
+                return None
+        return creds if creds and creds.valid else None
+    except Exception as e:
+        logger.warning(f"Could not load cached YouTube credentials: {e}")
+        return None
+
+
+def build_headless_auth_url() -> str:
+    """Create an OAuth URL the user can open on ANY device (phone/laptop).
+    Google will redirect to a dead localhost URL — the user copies that URL back."""
+    global _HEADLESS_FLOW
+    flow = _load_auth_flow()
+    flow.redirect_uri = "http://localhost:1"  # dead port; the code still lands in the URL bar
+    auth_url, _ = flow.authorization_url(
+        access_type="offline", include_granted_scopes="true", prompt="consent"
+    )
+    _HEADLESS_FLOW = flow  # stash flow for the code exchange step
+    return auth_url
+
+
+def exchange_auth_code(code_or_url: str):
+    """Exchange the pasted authorization code (or full redirect URL) for credentials."""
+    import pickle as _pickle
+
+    global _HEADLESS_FLOW
+    flow = _HEADLESS_FLOW or _load_auth_flow()
+    if flow.redirect_uri != "http://localhost:1":
+        flow.redirect_uri = "http://localhost:1"
+
+    code = code_or_url.strip()
+    if "code=" in code:
+        parsed = urllib.parse.parse_qs(urllib.parse.urlparse(code).query)
+        if parsed.get("code"):
+            code = parsed["code"][0]
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+    with open(YOUTUBE_TOKEN_FILE, "wb") as f:
+        _pickle.dump(creds, f)
+    _HEADLESS_FLOW = None
+    logger.info("YouTube OAuth token saved (headless auth success)")
+    return creds
+
+
+def get_youtube_service_or_url():
+    """Return (youtube_service, None) if auth is ready, else (None, auth_url).
+    The auth_url path lets the Telegram agent guide headless sign-in."""
+    creds = get_cached_youtube_credentials()
+    if creds:
+        return build("youtube", "v3", credentials=creds), None
+    return None, build_headless_auth_url()
+
 YOUTUBE_SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube.force-ssl"
 ]
 
 def upload_video_to_youtube(video_path: str, thumb_path: str, meta_data: dict) -> str:
-    """Upload video to YouTube with thumbnail and pinned comment."""
+    """Upload video to YouTube with thumbnail and pinned comment.
+    Uses saved headless token (token.pickle) if available, else local browser flow."""
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video file not found: {video_path}")
-    if not os.path.exists("client_secrets.json"):
-        raise FileNotFoundError("client_secrets.json not found. Download from Google Cloud Console.")
 
-    flow = InstalledAppFlow.from_client_secrets_file('client_secrets.json', YOUTUBE_SCOPES)
-    credentials = flow.run_local_server(port=0)
+    credentials = get_cached_youtube_credentials()
+    if credentials is not None:
+        logger.info("Using cached YouTube credentials (token.pickle)")
+    else:
+        if not os.path.exists("client_secrets.json"):
+            raise FileNotFoundError("client_secrets.json not found. Download from Google Cloud Console.")
+        flow = InstalledAppFlow.from_client_secrets_file('client_secrets.json', YOUTUBE_SCOPES)
+        credentials = flow.run_local_server(port=0)
+        # Save for headless reuse (Telegram agent / server restarts)
+        try:
+            import pickle
+            with open(YOUTUBE_TOKEN_FILE, "wb") as f:
+                pickle.dump(credentials, f)
+        except Exception as e:
+            logger.warning(f"Could not cache credentials: {e}")
     youtube = build('youtube', 'v3', credentials=credentials)
 
     # Clean tags
@@ -1399,14 +1509,26 @@ def run_streamlit_dashboard():
 # ==============================================================================
 # 11. YouTube Comments Auto-Reply Prompt - FIXED + HF Sentiment Enhanced
 # ==============================================================================
-def reply_to_youtube_comments(video_id: str, use_hf_sentiment: bool = True):
-    """Auto-reply to YouTube comments using Gemini + HF Sentiment Analysis."""
-    if not os.path.exists("client_secrets.json"):
-        logger.error("client_secrets.json missing for comment reply")
-        return
+def reply_to_youtube_comments(video_id: str, use_hf_sentiment: bool = True, max_replies: int = 10):
+    """Auto-reply to YouTube comments using Gemini + HF Sentiment Analysis.
+    Uses saved headless token if available. Returns a stats dict: {replied, scanned, errors}."""
+    stats = {"replied": 0, "scanned": 0, "errors": 0}
 
-    flow = InstalledAppFlow.from_client_secrets_file('client_secrets.json', YOUTUBE_SCOPES)
-    credentials = flow.run_local_server(port=0)
+    credentials = get_cached_youtube_credentials()
+    if credentials is not None:
+        logger.info("Using cached YouTube credentials (token.pickle)")
+    else:
+        if not os.path.exists("client_secrets.json"):
+            logger.error("client_secrets.json missing for comment reply")
+            return stats
+        flow = InstalledAppFlow.from_client_secrets_file('client_secrets.json', YOUTUBE_SCOPES)
+        credentials = flow.run_local_server(port=0)
+        try:
+            import pickle
+            with open(YOUTUBE_TOKEN_FILE, "wb") as f:
+                pickle.dump(credentials, f)
+        except Exception as e:
+            logger.warning(f"Could not cache credentials: {e}")
     youtube = build('youtube', 'v3', credentials=credentials)
 
     try:
@@ -1440,6 +1562,10 @@ def reply_to_youtube_comments(video_id: str, use_hf_sentiment: bool = True):
             replies = item.get("replies", {}).get("comments", [])
 
             if len(replies) == 0 and text:
+                if stats["replied"] >= max_replies:
+                    logger.info(f"Reached max_replies limit ({max_replies}), stopping")
+                    break
+                stats["scanned"] += 1
                 try:
                     # Advanced: Analyze sentiment with HF before replying
                     sentiment_info = ""
@@ -1502,14 +1628,19 @@ def reply_to_youtube_comments(video_id: str, use_hf_sentiment: bool = True):
                             }
                         }
                     ).execute()
+                    stats["replied"] += 1
                     logger.info(f"Replied to {author}: {reply_text[:50]}")
                     time.sleep(1.5)
                 except Exception as e:
                     logger.warning(f"Failed to reply to comment {top_comment_id}: {e}")
+                    stats["errors"] += 1
                     time.sleep(2)
 
     except Exception as e:
         logger.error(f"API Quota/Rate Limit Error: {e}")
+        stats["errors"] += 1
+
+    return stats
 
 if __name__ == "__main__":
     # Streamlit sets __name__ == "__main__" when running via `streamlit run`

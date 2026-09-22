@@ -39,13 +39,15 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 # ---- Application -------------------------------------------------------------
-COPY app.py hf_engine.py telegram_agent.py ./
+COPY app.py hf_engine.py agent_brain.py telegram_agent.py docker-entrypoint.sh ./
 COPY .env.example ./
 
 # Non-root user for safety; temp_assets + model cache stay writable via volumes
 RUN useradd -m -u 1000 aurastream \
     && mkdir -p temp_assets /app/.cache/huggingface \
-    && chown -R aurastream:aurastream /app
+    && chown -R aurastream:aurastream /app \
+    && chmod +x /app/docker-entrypoint.sh \
+    && chmod 0777 /app/temp_assets /app/.cache/huggingface
 USER aurastream
 
 # Persist renders + whisper/HF model downloads
@@ -54,9 +56,11 @@ VOLUME ["/app/temp_assets", "/app/.cache/huggingface"]
 EXPOSE 8501
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=120s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=5).status==200 else 1)"
+    CMD python -c "import urllib.request,os,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:%s/_stcore/health' % os.getenv('PORT','8501'), timeout=5).status==200 else 1)"
 
-# Default: Streamlit web dashboard. For the Telegram AI Agent override with:
-#   docker run --env-file .env aurastream python telegram_agent.py
-#   (or: docker compose --profile agent up agent)
-CMD ["streamlit", "run", "app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+
+# Default: Streamlit dashboard (+ Telegram agent when RUN_TELEGRAM_AGENT=true).
+# The agent-only mode: docker compose --profile agent up agent  (command override
+# is passed straight through the entrypoint).
+CMD []

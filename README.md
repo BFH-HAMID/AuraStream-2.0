@@ -27,9 +27,9 @@ AuraStream is a complete, fully-automated YouTube AI Agent with **Hugging Face S
 18. **🧠 Hybrid AI Fallback:** If Gemini fails, automatically falls back to Mistral-7B/Zephyr-7B via HF - never fails!
 19. **✨ Enhanced Prompt Engineering:** HF LLM enhances thumbnail prompts for viral results
 20. **🔊 MMS-TTS Multilingual:** 1100+ languages TTS for truly global content
-21. **🤖 Telegram AI Agent:** A full conversational AI agent on Telegram — run the entire studio from your phone (`/produce`, `/script`, `/trends`, free-text AI chat) → `telegram_agent.py`
+21. **🤖 Telegram AI Agent (with persistent memory):** A full conversational AI agent on Telegram that *knows your channel* — channel profile, custom instructions, facts, full video history stored in SQLite. `/produce`, `/suggest` (trend analysis + tap-to-produce buttons), `/upload` (headless YouTube OAuth), `/comments` (sentiment-aware auto-replies), `/settings`, `/remember`, `/history`, free-text chat with intent detection → `telegram_agent.py` + `agent_brain.py`
 22. **🎞️ 1080p Full HD Engine:** Footage is auto-selected at exactly **1920×1080** (Pexels/Pixabay best-rendition picker), every clip is scale+cropped to Full HD, rendered at 30fps H.264 with adaptive 8 Mbps bitrate
-23. **🐳 Dockerfile Ready:** One-command deployment — `docker compose up` for the dashboard, `docker compose --profile agent up` to also run the Telegram AI Agent
+23. **🐳 Dockerfile Ready:** One-command deployment — `docker compose up` for the dashboard, `docker compose --profile agent up` to also run the Telegram AI Agent, or `RUN_TELEGRAM_AGENT=true` for both in one container (**HF Space ready** — see `DEPLOY_HF_SPACE.md`)
 
 ## 🤔 Why Hugging Face Makes It More Advanced?
 
@@ -80,24 +80,35 @@ The image uses **CPU-only PyTorch** (2.5 GB smaller), ships with ffmpeg + fonts,
 
 ## 🤖 Telegram AI Agent
 
-Control the whole studio from your phone:
+Control the whole studio from your phone — and the agent **remembers your channel**:
 
 1. Talk to **@BotFather** on Telegram → `/newbot` → copy the token
 2. Add to `.env`: `TELEGRAM_BOT_TOKEN=123456:ABC-DEF...`
-3. Run: `python telegram_agent.py` (or `docker compose --profile agent up agent`)
+3. Run: `python telegram_agent.py` (or `docker compose --profile agent up agent`, or deploy to HF Space — see `DEPLOY_HF_SPACE.md`)
 
 | Command | What it does |
 |---|---|
-| `/produce <topic>` | 🎬 **Full autopilot**: script → voiceover → **1080p Full HD video** → AI thumbnail → delivered into the chat |
+| `/suggest [region]` | 💡 **5 trending topic ideas with virality scores + reasons**, tailored to your niche & past videos — tap **🎬 Produce** or **📜 Script** buttons right in the chat |
+| `/produce <topic>` | 🎬 **Full autopilot**: script → voiceover → **1080p Full HD video** → AI thumbnail → delivered into the chat (remembered for `/upload`) |
+| `/upload [last\|id]` | ⬆️ **Uploads to YouTube** — headless OAuth: bot sends a Google sign-in link, you paste the redirect URL back, done. Token saved for reuse |
+| `/comments [video_id] [max]` | 💬 **Reads comments, analyzes sentiment + emotion, writes empathetic auto-replies**, reports a summary |
+| `/settings` | ⚙️ Teach the agent your channel: `/settings set niche tech reviews`, `/settings set tone funny`, `/settings custom always open with a shocking fact` |
+| `/remember <fact>` | 🧠 "my audience loves short tutorials" — used in every future script/reply/suggestion |
+| `/history` | 📚 Every produced/uploaded video with links |
 | `/script <topic>` | Full script + SEO metadata (Gemini → HF Mistral fallback) |
-| `/trends [region]` | Trending topic ideas from Google Trends |
+| `/trends [region]` | Quick trending topic peek |
 | `/thumbnail <prompt> \| <title>` | AI thumbnail (SDXL → Pollinations) |
 | `/translate <lang> <text>` | Translation via NLLB-200 → Gemini (200+ languages) |
 | `/sentiment <text>` | Comment sentiment + emotion analysis |
-| `/status` | API key & engine status |
-| Just type anything | 💬 Free-text AI chat — with "make a video about X" intent detection that triggers a full production |
+| `/status` | API keys, engines, YouTube auth & memory status |
+| `/forget yes` | 🧹 Wipe agent memory |
+| Just type anything | 💬 Free-text chat **with full memory context** — "make a video about X", "suggest topics", "upload my last video", "reply to comments" all work as plain sentences |
 
-Progress updates are edited live in the chat while the 1080p render runs, and the finished video + thumbnail + `script.json` are sent straight back to you.
+**Agent memory (`agent_brain.py`):** SQLite database storing channel profile, custom instructions, learned facts, production history and suggestions. Every AI reply (chat, scripts, suggestions) is conditioned on this context — the more you use it, the more personalized it gets. Override location with `AGENT_MEMORY_DB`.
+
+## 🤗 Deploy on Hugging Face Spaces (Free)
+
+Full step-by-step guide in **`DEPLOY_HF_SPACE.md`**. TL;DR: create a **Docker** Space → upload the repo files → add secrets (`TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`, ..., `RUN_TELEGRAM_AGENT=true`) → set `app_port: 8501` in the Space README → the dashboard + Telegram agent run together in one free Space. Add a free UptimeRobot ping so the bot never sleeps.
 
 ## 🎞️ 1080p Full HD Engine
 
@@ -163,10 +174,12 @@ User Topic → [Trends API]
 ## 📦 New Files Added
 
 - `hf_engine.py` - Complete Hugging Face engine with 10+ SOTA models
-- `telegram_agent.py` - 🤖 Full Telegram AI Agent (chat + autopilot 1080p productions)
-- `Dockerfile` + `docker-compose.yml` + `.dockerignore` - 🐳 Production-ready Docker deployment
-- Updated `app.py` - Hybrid AI pipeline + 1080p Full HD render engine
-- Updated `.env.example` - Includes HF API key + Telegram agent setup guide
+- `agent_brain.py` - 🧠 Persistent agent memory (SQLite) + topic suggestion engine + intent router
+- `telegram_agent.py` - 🤖 Full Telegram AI Agent with memory (suggest/produce/upload/comments/settings)
+- `Dockerfile` + `docker-compose.yml` + `docker-entrypoint.sh` + `.dockerignore` - 🐳 Production-ready Docker / HF Space deployment
+- `DEPLOY_HF_SPACE.md` - 🤗 Free Hugging Face Spaces deployment guide
+- Updated `app.py` - Hybrid AI pipeline + 1080p Full HD render + headless YouTube OAuth
+- Updated `.env.example` - HF key + Telegram agent + Google OAuth env vars
 - Updated `requirements.txt` - Includes HF libraries + python-telegram-bot
 
 ## 🌟 Demo - What HF Adds
