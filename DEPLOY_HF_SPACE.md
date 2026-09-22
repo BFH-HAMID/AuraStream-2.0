@@ -73,6 +73,7 @@ app_port: 8501
 | **48h inactivity** por Space sleep kore | Bot offline hoye jay | https://uptimerobot.com (free) theke Space URL `https://<user>-<space>.hf.space` 10 min por por ping koro — bot always-on thakbe |
 | Space **restart** hole file haray | `token.pickle`, agent memory reset | Re-auth koro (`/upload`), profile abar `/settings` diye dao |
 | Long render er somoy bot ta reply kore na | — | Normal — rendering background e cholche, progress message update hoy |
+| Space restart hole **schedules** (auto-pilot) o reset hoy | APScheduler in-memory | `/schedule` abar set koro (ek line) |
 
 ## Local vs Space
 

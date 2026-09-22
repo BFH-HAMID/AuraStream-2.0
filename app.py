@@ -149,14 +149,21 @@ def get_font_path(size: int = 90):
 # ==============================================================================
 # 1. Gemini Script & Metadata Prompt
 # ==============================================================================
-def generate_long_script(topic: str, duration_mins: int) -> dict:
+def generate_long_script(topic: str, duration_mins: int, research_facts: str = "") -> dict:
     """Generate documentary script and metadata using Gemini."""
     client = get_gemini_client()
     target_words = duration_mins * 150
 
+    research_block = ""
+    if research_facts:
+        research_block = (
+            "\n    VERIFIED RESEARCH FACTS (weave these naturally into the script, stay accurate):\n"
+            f"    {research_facts[:2000]}\n"
+        )
+
     prompt = f"""
     Write a full documentary script about "{topic}".
-    Target word count should be around {target_words} words.
+    Target word count should be around {target_words} words.{research_block}
     Enforce strict JSON output with these exact keys:
     - title: Catchy YouTube title under 100 characters.
     - description: SEO-friendly summary with timestamps/chapters.
@@ -183,28 +190,29 @@ def generate_long_script(topic: str, duration_mins: int) -> dict:
 # ==============================================================================
 # 2. Voiceover & Audio Engine Prompt
 # ==============================================================================
-async def generate_voiceover_async(text: str, output_path: str):
-    """Async TTS using edge-tts with pause handling."""
+async def generate_voiceover_async(text: str, output_path: str, voice: str = None):
+    """Async TTS using edge-tts with pause handling. Voice via /voices use <name> or DEFAULT_TTS_VOICE."""
     # Parse by periods, join with explicit pauses for more natural speech
     sentences = [s.strip() for s in text.split('.') if s.strip()]
     if not sentences:
         raise ValueError("No sentences to synthesize")
 
     processed_text = "... ".join(sentences) + "."
-    communicate = edge_tts.Communicate(processed_text, "en-US-ChristopherNeural")
+    voice = voice or os.getenv("DEFAULT_TTS_VOICE", "").strip() or "en-US-ChristopherNeural"
+    communicate = edge_tts.Communicate(processed_text, voice)
     await communicate.save(output_path)
     logger.info(f"Voiceover saved to {output_path}")
 
-def generate_voiceover_sync(text: str, output_path: str):
+def generate_voiceover_sync(text: str, output_path: str, voice: str = None):
     """Sync wrapper for Streamlit and non-async contexts."""
     try:
         # If there's already a running loop (unlikely in Streamlit), create new
-        asyncio.run(generate_voiceover_async(text, output_path))
+        asyncio.run(generate_voiceover_async(text, output_path, voice))
     except RuntimeError:
         # Fallback for environments with existing loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(generate_voiceover_async(text, output_path))
+        loop.run_until_complete(generate_voiceover_async(text, output_path, voice))
         loop.close()
 
 # ==============================================================================
@@ -783,7 +791,8 @@ def get_youtube_service_or_url():
 
 YOUTUBE_SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
-    "https://www.googleapis.com/auth/youtube.force-ssl"
+    "https://www.googleapis.com/auth/youtube.force-ssl",
+    "https://www.googleapis.com/auth/yt-analytics.readonly"
 ]
 
 def upload_video_to_youtube(video_path: str, thumb_path: str, meta_data: dict) -> str:
@@ -959,7 +968,7 @@ def translate_script(text: str, target_lang: str) -> str:
 # ==============================================================================
 # 9b. Hugging Face Advanced Features - NEW ADVANCED LEVEL
 # ==============================================================================
-def generate_long_script_hf_fallback(topic: str, duration_mins: int, provider: str = "auto") -> dict:
+def generate_long_script_hf_fallback(topic: str, duration_mins: int, provider: str = "auto", research_facts: str = "") -> dict:
     """
     Advanced script generation with HF fallback
     provider: auto, gemini, huggingface, hybrid
@@ -978,11 +987,11 @@ def generate_long_script_hf_fallback(topic: str, duration_mins: int, provider: s
         return {}
 
     if provider == "gemini":
-        return generate_long_script(topic, duration_mins)
+        return generate_long_script(topic, duration_mins, research_facts=research_facts)
 
     # Auto / Hybrid: Try Gemini first, fallback to HF
     try:
-        result = generate_long_script(topic, duration_mins)
+        result = generate_long_script(topic, duration_mins, research_facts=research_facts)
         if result and result.get("title"):
             return result
     except Exception as e:

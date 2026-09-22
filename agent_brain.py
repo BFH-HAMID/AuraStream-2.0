@@ -30,7 +30,8 @@ logger = logging.getLogger("agent_brain")
 DB_PATH = Path(os.getenv("AGENT_MEMORY_DB", "temp_assets/agent_memory.db"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-PROFILE_KEYS = ["niche", "tone", "audience", "language", "region", "upload_privacy", "channel_name"]
+PROFILE_KEYS = ["niche", "tone", "audience", "language", "region", "upload_privacy", "channel_name",
+                "tts_voice", "produce_languages", "alert_keywords"]
 
 _INTENTS = [
     "produce",      # full video production
@@ -45,6 +46,14 @@ _INTENTS = [
     "history",      # show past videos
     "remember",     # store a fact
     "settings",     # view/update profile
+    "schedule",     # auto-pilot scheduler
+    "analytics",    # YouTube analytics report
+    "shorts",       # make shorts from last video
+    "localize",     # multi-language versions
+    "research",     # research a topic
+    "alerts",       # trend spike alert settings
+    "boost",        # engagement boost (top comment reply)
+    "voices",       # list/select TTS voices
     "chat",         # plain conversation
 ]
 
@@ -77,7 +86,7 @@ def _init_db():
                 topic TEXT, title TEXT, video_id TEXT,
                 video_path TEXT, thumb_path TEXT,
                 status TEXT DEFAULT 'produced',
-                tags TEXT, description TEXT,
+                tags TEXT, description TEXT, narration TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS suggested_topics (
@@ -87,11 +96,48 @@ def _init_db():
                 audience TEXT, status TEXT DEFAULT 'suggested',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS schedules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                time_text TEXT NOT NULL,
+                auto_upload INTEGER DEFAULT 0,
+                active INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS kv (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
             """
         )
+        # Migrations for databases created by older versions
+        for col in ("narration TEXT", "description TEXT"):
+            try:
+                conn.execute(f"ALTER TABLE video_history ADD COLUMN {col}")
+            except Exception:
+                pass  # column already exists
 
 
 _init_db()
+
+
+# =============================================================================
+# Key-value store (last chat id, small runtime state)
+# =============================================================================
+def kv_set(key: str, value: str):
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO kv (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+
+
+def kv_get(key: str, default: str = "") -> str:
+    with _connect() as conn:
+        row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row and row["value"] is not None else default
 
 
 # =============================================================================
@@ -159,14 +205,14 @@ def forget_everything() -> None:
 # =============================================================================
 def add_history(topic: str, title: str, video_id: str = "", video_path: str = "",
                 thumb_path: str = "", tags=None, status: str = "produced",
-                description: str = "") -> int:
+                description: str = "", narration: str = "") -> int:
     if isinstance(tags, (list, tuple)):
         tags = ", ".join(str(t) for t in tags)
     with _connect() as conn:
         cur = conn.execute(
-            "INSERT INTO video_history (topic, title, video_id, video_path, thumb_path, status, tags, description) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (topic, title, video_id, video_path, thumb_path, status, tags or "", description or ""),
+            "INSERT INTO video_history (topic, title, video_id, video_path, thumb_path, status, tags, description, narration) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (topic, title, video_id, video_path, thumb_path, status, tags or "", description or "", narration or ""),
         )
         return cur.lastrowid
 
@@ -207,6 +253,30 @@ def mark_suggestion_used(topic: str):
             "(SELECT id FROM suggested_topics WHERE topic = ? ORDER BY id DESC LIMIT 1)",
             (topic,),
         )
+
+
+# =============================================================================
+# Schedules (auto-pilot) — "ekbar set, bot nije nije banabe"
+# =============================================================================
+def add_schedule(chat_id: int, kind: str, time_text: str, auto_upload: bool = False) -> int:
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO schedules (chat_id, kind, time_text, auto_upload) VALUES (?, ?, ?, ?)",
+            (chat_id, kind, time_text, int(auto_upload)),
+        )
+        return cur.lastrowid
+
+
+def get_schedules(active_only: bool = True) -> List[Dict]:
+    q = "SELECT * FROM schedules" + (" WHERE active = 1" if active_only else "") + " ORDER BY id DESC"
+    with _connect() as conn:
+        return [dict(r) for r in conn.execute(q)]
+
+
+def set_all_schedules_active(active: bool) -> int:
+    with _connect() as conn:
+        cur = conn.execute("UPDATE schedules SET active = ?", (int(active),))
+        return cur.rowcount
 
 
 # =============================================================================
@@ -341,6 +411,7 @@ def suggest_topics(region: str = "united_states", n: int = 5) -> List[Dict]:
 # Intent router — free text -> structured action ("agent er moto kotha bole")
 # =============================================================================
 _FAST_PATHS = [
+    (re.compile(r"^\s*shorts?\b|\bmake\b.*\bshorts?\b|\bshorts?\b.*\b(make|create|banao)\b", re.I), "shorts"),
     (re.compile(r"\b(make|create|produce|generate|banao|banabo|bana)\b.*\bvideo\b|\bvideo\b.*\b(banao|banabo|make|produce)\b", re.I), "produce"),
     (re.compile(r"\b(suggest|topic ideas?|ideas? for|kemon topic|topic suggest)\b", re.I), "suggest"),
     (re.compile(r"^\s*/?upload\b|\bupload\b.*\byoutube\b", re.I), "upload"),
@@ -350,6 +421,13 @@ _FAST_PATHS = [
     (re.compile(r"^\s*translate\b", re.I), "translate"),
     (re.compile(r"\b(sentiment|emotion)\b.*\b(analy|check|detect)", re.I), "sentiment"),
     (re.compile(r"^\s*(status|engine status)\b|\b(engine|system) status\b", re.I), "status"),
+    (re.compile(r"^\s*(schedule|autopilot schedule|auto schedule)\b|\bschedule\b.*\b(daily|every|interval)\b", re.I), "schedule"),
+    (re.compile(r"\banalytics\b|\bhow (are|is) my (videos?|channel)|\bviews report\b|\bperformance report\b", re.I), "analytics"),
+    (re.compile(r"^\s*(localize|localise|translate video|multi.?language)\b", re.I), "localize"),
+    (re.compile(r"^\s*research\b|\bresearch (about|on)\b|\bfacts? about\b", re.I), "research"),
+    (re.compile(r"^\s*(trend )?alerts?\b", re.I), "alerts"),
+    (re.compile(r"^\s*(boost|engagement boost|pin)\b|\btop comment\b", re.I), "boost"),
+    (re.compile(r"^\s*voices?\b", re.I), "voices"),
     (re.compile(r"^\s*(history|my videos|past videos)\b|\bvideo history\b.*\b(dekhao|show|dik)\b|\bshow\b.*\bhistory\b", re.I), "history"),
     (re.compile(r"^\s*remember\s+\S+", re.I), "remember"),
     (re.compile(r"^\s*(settings|setting)\b", re.I), "settings"),

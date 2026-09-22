@@ -29,6 +29,7 @@ AuraStream is a complete, fully-automated YouTube AI Agent with **Hugging Face S
 20. **🔊 MMS-TTS Multilingual:** 1100+ languages TTS for truly global content
 21. **🤖 Telegram AI Agent (with persistent memory):** A full conversational AI agent on Telegram that *knows your channel* — channel profile, custom instructions, facts, full video history stored in SQLite. `/produce`, `/suggest` (trend analysis + tap-to-produce buttons), `/upload` (headless YouTube OAuth), `/comments` (sentiment-aware auto-replies), `/settings`, `/remember`, `/history`, free-text chat with intent detection → `telegram_agent.py` + `agent_brain.py`
 22. **🎞️ 1080p Full HD Engine:** Footage is auto-selected at exactly **1920×1080** (Pexels/Pixabay best-rendition picker), every clip is scale+cropped to Full HD, rendered at 30fps H.264 with adaptive 8 Mbps bitrate
+24. **⏰ Auto-Pilot Pack (ALL FREE):** `/schedule daily 18:00` auto-productions with auto-upload · `/analytics` YouTube performance reports · `/shorts` 9:16 Shorts · `/localize bn,hi` multi-language versions · `/thumbs` A/B/C thumbnail testing · `/research` facts from Wikipedia + Google News woven into scripts · `/alerts` proactive trend-spike notifications · `/boost` top-comment engagement replies · `/voices` 400+ free neural voices · `/reauth` fresh sign-in
 23. **🐳 Dockerfile Ready:** One-command deployment — `docker compose up` for the dashboard, `docker compose --profile agent up` to also run the Telegram AI Agent, or `RUN_TELEGRAM_AGENT=true` for both in one container (**HF Space ready** — see `DEPLOY_HF_SPACE.md`)
 
 ## 🤔 Why Hugging Face Makes It More Advanced?
@@ -102,6 +103,16 @@ Control the whole studio from your phone — and the agent **remembers your chan
 | `/sentiment <text>` | Comment sentiment + emotion analysis |
 | `/status` | API keys, engines, YouTube auth & memory status |
 | `/forget yes` | 🧹 Wipe agent memory |
+| `/schedule daily 18:00 [upload]` | ⏰ **Auto-pilot**: every day at that time the bot picks the top trending suggestion and produces a full 1080p video (add `upload` to publish automatically) |
+| `/analytics [days]` | 📊 YouTube Analytics report: views, watch time, subs gained + top videos — with "best performer = next topic" advice |
+| `/shorts` | 📱 Cuts a 9:16 vertical Shorts from the last produced video, delivered in chat |
+| `/localize bn,hi` | 🌐 Makes Bengali/Hindi/etc. versions of the last video (translate → neural voice → Full HD audio swap) |
+| `/thumbs <prompt> \| <title>` | 🖼️ Generates **3 thumbnail variants** (cinematic / vibrant / minimalist) — tap the winner, it becomes the upload thumbnail |
+| `/research <topic>` | 🔬 Wikipedia summary + live Google News headlines — auto-injected into every script for accuracy |
+| `/alerts <keywords>` | 🚨 Checks trends every 6h — messages you proactively when a keyword spikes 1.8x+ |
+| `/boost [video_id]` | 🎁 Finds the most-liked comment, replies personally (YouTube API cannot pin — this is the next best thing), sends stats |
+| `/voices [lang]` | 🎙️ 400+ free Edge-TTS voices (Bangla `bn-BD` included) — `/voices use <name>` sets the default |
+| `/reauth` | 🔐 Fresh YouTube sign-in (adds the analytics scope) |
 | Just type anything | 💬 Free-text chat **with full memory context** — "make a video about X", "suggest topics", "upload my last video", "reply to comments" all work as plain sentences |
 
 **Agent memory (`agent_brain.py`):** SQLite database storing channel profile, custom instructions, learned facts, production history and suggestions. Every AI reply (chat, scripts, suggestions) is conditioned on this context — the more you use it, the more personalized it gets. Override location with `AGENT_MEMORY_DB`.

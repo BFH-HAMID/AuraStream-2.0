@@ -32,8 +32,10 @@ import io
 import json
 import logging
 import os
+import shutil
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -58,6 +60,17 @@ SUGGESTION_MAP = {}
 # Persistent productions (survive for /upload) — NOT cleaned up like tmp files
 PRODUCTION_DIR = Path(os.getenv("AGENT_PRODUCTION_DIR", "temp_assets/agent_productions"))
 PRODUCTION_DIR.mkdir(parents=True, exist_ok=True)
+
+# Auto-pilot scheduler (started in post_init)
+try:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    SCHEDULER = AsyncIOScheduler(timezone=os.getenv("SCHEDULER_TZ", "Asia/Dhaka"))
+except ImportError:
+    SCHEDULER = None
+BOT_REF = None
+
+# A/B thumbnail variants: variant letter -> file path
+THUMB_MAP = {}
 
 # ---------------------------------------------------------------------------
 # Lazy AuraStream engine loader
@@ -211,9 +224,22 @@ async def run_full_production(bot, chat_id: int, topic: str):
     status = await bot.send_message(chat_id, f"🚀 *Autopilot engaged!*\n\nTopic: *{topic}*\nTarget: *1080p Full HD*\n\n1/6 · Generating script...")
     try:
         engine = get_engine()
+        import agent_features
 
-        # 1) Script + metadata (Gemini -> HF fallback), flavored by channel profile
-        script_data = await asyncio_to_thread(engine.generate_long_script_hf_fallback, topic, 2, "auto")
+        # 0) Fresh research (Wikipedia + Google News — free, keyless) for factual scripts
+        research_facts = ""
+        try:
+            research = await asyncio_to_thread(agent_features.research_topic, topic)
+            research_facts = research.get("facts_text", "")
+            if research_facts:
+                await bot.send_message(chat_id, "🔬 Research done: verified facts + latest news collected for the script.")
+        except Exception as e:
+            logger.warning(f"Research skipped: {e}")
+
+        voice_pref = agent_brain.get_profile().get("tts_voice") or None
+
+        # 1) Script + metadata (Gemini -> HF fallback), flavored by profile + research
+        script_data = await asyncio_to_thread(engine.generate_long_script_hf_fallback, topic, 2, "auto", research_facts)
         if not script_data:
             script_data = await asyncio_to_thread(engine.generate_long_script, topic, 2)
         if not script_data:
@@ -231,7 +257,7 @@ async def run_full_production(bot, chat_id: int, topic: str):
         await status.edit_text("2/6 · Synthesizing voiceover (Edge-TTS → HF MMS)...")
         voiceover_path = os.path.join(tmp_dir, "voiceover.mp3")
         try:
-            await asyncio_to_thread(engine.generate_voiceover_sync, full_script[:4000], voiceover_path)
+            await asyncio_to_thread(engine.generate_voiceover_sync, full_script[:4000], voiceover_path, voice_pref)
         except Exception as e:
             logger.warning(f"Edge-TTS failed, trying HF: {e}")
             ok = await asyncio_to_thread(engine.generate_voiceover_hf, full_script[:500], voiceover_path, "en")
@@ -311,11 +337,13 @@ async def run_full_production(bot, chat_id: int, topic: str):
             thumb_path=thumb_path if thumb_ok else "",
             tags=script_data.get("tags", ""),
             description=script_data.get("description", ""),
+            narration=full_script[:8000],
             status="produced",
         )
         await status.edit_text(
             f"🏁 Production complete in {time.time() - started:.0f}s! 🎬\n"
-            f"🧠 Saved to memory. `/upload last` to publish on YouTube."
+            f"🧠 Saved to memory.\n\n"
+            f"`/upload last` → publish • `/shorts` → 9:16 Shorts • `/localize bn,hi` → more languages • `/thumbs` → A/B thumbnail"
         )
     except Exception as e:
         logger.exception("Full production failed")
@@ -336,6 +364,179 @@ async def run_full_production(bot, chat_id: int, topic: str):
 
 # asyncio.to_thread shim (py3.8 compatibility not needed, but keep import local)
 from asyncio import to_thread as asyncio_to_thread  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Upload (module level — shared by /upload, free-text auth flow, scheduler)
+# ---------------------------------------------------------------------------
+async def perform_upload(bot, chat_id: int, item: dict):
+    engine = get_engine()
+    msg = await bot.send_message(chat_id, f"⬆️ Uploading *{item.get('title') or item.get('topic')}* to YouTube...")
+    meta = {
+        "title": item.get("title") or item.get("topic") or "AuraStream Video",
+        "description": item.get("description", ""),
+        "tags": item.get("tags", ""),
+    }
+    try:
+        video_id = await asyncio_to_thread(engine.upload_video_to_youtube, item["video_path"], item.get("thumb_path") or "", meta)
+        agent_brain.add_history(
+            topic=item.get("topic", ""), title=meta["title"], video_id=video_id,
+            video_path=item.get("video_path", ""), thumb_path=item.get("thumb_path", ""),
+            tags=meta["tags"], status="uploaded", description=meta["description"],
+            narration=item.get("narration", ""),
+        )
+        await msg.edit_text(
+            f"🎉 *Published on YouTube!*\n\n🔗 https://youtube.com/watch?v={video_id}\n"
+            f"📌 Engagement comment added\n"
+            f"⏰ Engagement boost scheduled (+24h) — top comment reply + stats\n"
+            f"🧠 Saved to history — use `/comments` to manage replies",
+            parse_mode="Markdown",
+        )
+        engine.send_telegram_message(f"🚀 AuraStream: '{meta['title']}' is LIVE → https://youtube.com/watch?v={video_id}")
+        # Schedule the 24h engagement booster (top-comment reply + stats report)
+        try:
+            if SCHEDULER is not None:
+                from apscheduler.triggers.date import DateTrigger
+                SCHEDULER.add_job(
+                    scheduled_engagement_job, DateTrigger(run_date=datetime.now(timezone.utc) + timedelta(hours=24)),
+                    args=[chat_id, video_id], id=f"boost_{video_id}", misfire_grace_time=3600, replace_existing=True,
+                )
+        except Exception as e:
+            logger.warning(f"Could not schedule engagement boost: {e}")
+    except Exception as e:
+        logger.exception("Upload failed")
+        await msg.edit_text(f"❌ Upload failed: `{e}`", parse_mode="Markdown")
+
+
+# ---------------------------------------------------------------------------
+# Scheduler jobs (auto-pilot production, engagement boost, trend alerts)
+# ---------------------------------------------------------------------------
+def register_one_schedule(s: dict):
+    if SCHEDULER is None:
+        return
+    from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.triggers.interval import IntervalTrigger
+    job_id = f"prod_{s['id']}"
+    if s["kind"] == "daily":
+        h, m = s["time_text"].split(":")
+        trigger = CronTrigger(hour=int(h), minute=int(m))
+    else:
+        trigger = IntervalTrigger(hours=int(str(s["time_text"]).rstrip("h")))
+    SCHEDULER.add_job(scheduled_production_job, trigger,
+                      args=[int(s["chat_id"]), bool(s["auto_upload"])],
+                      id=job_id, misfire_grace_time=3600, replace_existing=True)
+
+
+def register_schedule_jobs():
+    import agent_brain
+    for s in agent_brain.get_schedules(active_only=True):
+        try:
+            register_one_schedule(s)
+        except Exception as e:
+            logger.warning(f"Could not register schedule #{s.get('id')}: {e}")
+
+
+async def scheduled_production_job(chat_id: int, auto_upload: bool):
+    """Auto-pilot: pick the top suggestion, produce a full 1080p video, optionally upload."""
+    import agent_brain
+    if BOT_REF is None:
+        return
+    try:
+        region = agent_brain.get_profile().get("region", "united_states")
+        sugs = await asyncio_to_thread(agent_brain.suggest_topics, region, 3)
+        topic = sugs[0]["topic"] if sugs else ""
+        if not topic:
+            await BOT_REF.send_message(chat_id, "⏰ Auto-pilot: could not pick a topic (check API keys).")
+            return
+        agent_brain.mark_suggestion_used(topic)
+        await BOT_REF.send_message(chat_id, f"⏰ *Auto-pilot triggered!*\n🎬 Producing top suggestion: *{topic}*", parse_mode="Markdown")
+        await run_full_production(BOT_REF, chat_id, topic)
+        if auto_upload:
+            item = agent_brain.get_last_production()
+            if item and item.get("video_path") and item.get("status") == "produced":
+                await perform_upload(BOT_REF, chat_id, item)
+    except Exception as e:
+        logger.exception("Scheduled production failed")
+        try:
+            await BOT_REF.send_message(chat_id, f"❌ Auto-pilot run failed: {e}")
+        except Exception:
+            pass
+
+
+async def scheduled_engagement_job(chat_id: int, video_id: str):
+    """+24h after upload: reply to the most-liked comment + send a stats report."""
+    import agent_features
+    if BOT_REF is None:
+        return
+    try:
+        result = await asyncio_to_thread(agent_features.engagement_boost, get_engine(), video_id)
+        stats = result.get("stats", {})
+        top = result.get("top_comment")
+        lines = [f"🎁 *Engagement boost* for *{stats.get('title', video_id)}*",
+                 f"👁️ {stats.get('views', 0):,} views · 👍 {stats.get('likes', 0):,} · 💬 {stats.get('comments', 0):,}"]
+        if top:
+            lines.append(f"\n🏆 Hottest comment ({top['likes']} likes) from {top['author']}:\n\"{top['text'][:150]}\"")
+            if result.get("replied"):
+                lines.append(f"↩️ Replied: _{result.get('reply_text', '')[:150]}_")
+            else:
+                lines.append("⚠️ Could not post the reply (permissions?)")
+        else:
+            lines.append("\n📭 No comments found yet.")
+        lines.append("\n💡 Note: YouTube API cannot *pin* comments — I replied to the top one instead.")
+        await BOT_REF.send_message(int(chat_id), "\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        logger.exception("Engagement boost failed")
+        try:
+            await BOT_REF.send_message(int(chat_id), f"❌ Engagement boost failed: {e}")
+        except Exception:
+            pass
+
+
+async def scheduled_trend_alert_job():
+    """Every 6h: check niche keywords for trend spikes and proactively alert."""
+    import agent_brain
+    import agent_features
+    if BOT_REF is None:
+        return
+    chat_id_raw = agent_brain.kv_get("last_chat_id", "")
+    if not chat_id_raw:
+        return
+    profile = agent_brain.get_profile()
+    kws = [k.strip() for k in (profile.get("alert_keywords") or "").split(",") if k.strip()]
+    niche = profile.get("niche", "")
+    if niche:
+        kws += [w for w in niche.split() if len(w) > 3][:2]
+    if not kws:
+        return
+    region = profile.get("region", "united_states")
+    spikes = await asyncio_to_thread(agent_features.trend_spike_check, kws, region)
+    if spikes:
+        top = spikes[0]
+        try:
+            await BOT_REF.send_message(
+                int(chat_id_raw),
+                f"🚨 *Trend spike alert!*\n\n`{top['keyword']}` is *{top['ratio']}x* hotter than usual right now!\n"
+                f"Produce it before others do:\n`/produce {top['keyword']}`\n\n"
+                f"(Turn alerts on/off: /alerts your keywords, comma separated)",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning(f"Trend alert send failed: {e}")
+
+
+async def post_init(app):
+    """PTB post-init: start the scheduler, register jobs, keep the bot ref."""
+    global BOT_REF
+    BOT_REF = app.bot
+    register_schedule_jobs()
+    if SCHEDULER is not None:
+        from apscheduler.triggers.interval import IntervalTrigger
+        SCHEDULER.add_job(scheduled_trend_alert_job, IntervalTrigger(hours=6),
+                          id="trend_alerts", misfire_grace_time=3600)
+        SCHEDULER.start()
+        logger.info("⏰ Auto-pilot scheduler started (productions + trend alerts)")
+    else:
+        logger.warning("APScheduler not installed — /schedule disabled (pip install apscheduler)")
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +587,17 @@ def build_application():
             "/remember \\<fact\\> — 🧠 store a fact\n"
             "/history — 📚 production history\n"
             "/forget yes — 🧹 wipe memory\n"
-            "/status — 📊 engines + auth + memory\n\n"
+            "/status — 📊 engines + auth + memory\n"
+            "⏰ */schedule* daily 18:00 \[upload\] — auto\-pilot productions\n"
+            "/analytics \[days\] — 📊 YouTube performance report\n"
+            "/shorts — 📱 9:16 Shorts from last video\n"
+            "/localize bn,hi — 🌐 multi\-language versions\n"
+            "/thumbs \<prompt\> — 🖼️ A/B/C thumbnail test\n"
+            "/research \<topic\> — 🔬 facts \+ fresh news\n"
+            "/alerts \<keywords\> — 🚨 trend spike alerts\n"
+            "/boost \[video\_id\] — 🎁 top\-comment engagement reply\n"
+            "/voices \[lang\] — 🎙️ voice catalogue (400+)\n"
+            "/reauth — 🔐 fresh YouTube sign\-in\n\n"
             "_Free text works too — I understand intents._",
             parse_mode="MarkdownV2",
         )
@@ -506,34 +717,9 @@ def build_application():
         ready = await ensure_youtube_auth(context.bot, update.effective_chat.id, "upload", payload)
         if not ready:
             return
-        await do_upload(context.bot, update.effective_chat.id, item)
+        await perform_upload(context.bot, update.effective_chat.id, item)
 
-    async def do_upload(bot, chat_id: int, item: dict):
-        engine = get_engine()
-        msg = await bot.send_message(chat_id, f"⬆️ Uploading *{item.get('title') or item.get('topic')}* to YouTube...")
-        meta = {
-            "title": item.get("title") or item.get("topic") or "AuraStream Video",
-            "description": item.get("description", ""),
-            "tags": item.get("tags", ""),
-        }
-        privacy = agent_brain.get_profile().get("upload_privacy", "public")
-        try:
-            video_id = await asyncio_to_thread(engine.upload_video_to_youtube, item["video_path"], item.get("thumb_path") or "", meta)
-            agent_brain.add_history(
-                topic=item.get("topic", ""), title=meta["title"], video_id=video_id,
-                video_path=item.get("video_path", ""), thumb_path=item.get("thumb_path", ""),
-                tags=meta["tags"], status="uploaded", description=meta["description"],
-            )
-            await msg.edit_text(
-                f"🎉 *Published on YouTube!*\n\n🔗 https://youtube.com/watch?v={video_id}\n"
-                f"📌 Pinned engagement comment added\n"
-                f"🧠 Saved to history — use `/comments` to manage replies",
-                parse_mode="Markdown",
-            )
-            engine.send_telegram_message(f"🚀 AuraStream: '{meta['title']}' is LIVE → https://youtube.com/watch?v={video_id}")
-        except Exception as e:
-            logger.exception("Upload failed")
-            await msg.edit_text(f"❌ Upload failed: `{e}`", parse_mode="Markdown")
+    # Upload/boost logic lives at module level (perform_upload) so the scheduler can reuse it.
 
     # ------------------------------------------------------------------
     # 💬 /comments — sentiment-aware auto-reply
@@ -745,6 +931,7 @@ def build_application():
     async def free_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (update.message.text or "").strip()
         chat_id = update.effective_chat.id
+        agent_brain.kv_set("last_chat_id", str(chat_id))
         lowered = text.lower()
 
         # 1) Waiting for an OAuth code?
@@ -758,10 +945,13 @@ def build_application():
                     if pending["action"] == "upload":
                         item = next((h for h in agent_brain.get_history(limit=20) if h["id"] == pending["payload"].get("history_id")), None)
                         if item:
-                            await do_upload(context.bot, chat_id, item)
+                            await perform_upload(context.bot, chat_id, item)
                             return
                     elif pending["action"] == "comments":
                         await do_comments(context.bot, chat_id, pending["payload"]["video_id"], pending["payload"].get("max", 10))
+                        return
+                    elif pending["action"] == "reauth":
+                        await wait.edit_text("✅ Re-auth complete — analytics scope added! Try /analytics 📊")
                         return
                 except Exception as e:
                     logger.warning(f"OAuth exchange failed: {e}")
@@ -823,7 +1013,300 @@ def build_application():
         else:
             await update.message.reply_text("Nothing to cancel 🙂")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # ------------------------------------------------------------------
+    # ⏰ /schedule — auto-pilot scheduler
+    # ------------------------------------------------------------------
+    async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        import agent_features
+        parsed = agent_features.parse_schedule_text(list(context.args or []))
+        if parsed is None:
+            await update.message.reply_text(
+                "Usage:\n`/schedule daily 18:00` (9am/6pm o chole)\n`/schedule daily 9am upload`\n"
+                "`/schedule interval 6h upload`\n`/schedule off` — stop all\n\n"
+                "Each run: top trending suggestion → full 1080p production → (optional) upload.",
+                parse_mode="Markdown",
+            )
+            return
+        if parsed["kind"] == "list":
+            rows = agent_brain.get_schedules()
+            if not rows:
+                await update.message.reply_text("📭 No schedules yet. Set one: `/schedule daily 18:00`", parse_mode="Markdown")
+                return
+            lines = ["⏰ *Schedules:*"] + [
+                f"• #{r['id']} — {r['kind']} {r['time_text']}" + (" +upload" if r["auto_upload"] else "") for r in rows
+            ]
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            return
+        if parsed["kind"] == "off":
+            n = agent_brain.set_all_schedules_active(False)
+            if SCHEDULER is not None:
+                for job in SCHEDULER.get_jobs():
+                    if job.id.startswith("prod_"):
+                        job.remove()
+            await update.message.reply_text(f"🛑 Stopped {n} schedule(s).")
+            return
+        sid = agent_brain.add_schedule(update.effective_chat.id, parsed["kind"], parsed["time_text"], parsed["auto_upload"])
+        register_one_schedule({"id": sid, "chat_id": update.effective_chat.id, "kind": parsed["kind"],
+                               "time_text": parsed["time_text"], "auto_upload": parsed["auto_upload"]})
+        tz = os.getenv("SCHEDULER_TZ", "Asia/Dhaka")
+        desc = f"daily at {parsed['time_text']} ({tz})" if parsed["kind"] == "daily" else f"every {parsed['time_text']}"
+        await update.message.reply_text(
+            f"✅ *Auto-pilot armed:* {desc}" + (" + auto-upload 🚀" if parsed["auto_upload"] else "") +
+            "\nBot nije top trending topic pick kore full video banabe!",
+            parse_mode="Markdown",
+        )
+
+    # ------------------------------------------------------------------
+    # 📊 /analytics — YouTube Analytics report
+    # ------------------------------------------------------------------
+    async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        import agent_features
+        days = 7
+        if context.args and context.args[0].isdigit():
+            days = min(max(int(context.args[0]), 1), 90)
+        msg = await update.message.reply_text(f"📊 Crunching your last *{days} days*...")
+        try:
+            report = await asyncio_to_thread(agent_features.fetch_analytics_report, get_engine(), days)
+            await msg.edit_text(report["summary"], parse_mode="Markdown")
+        except RuntimeError as e:
+            await msg.edit_text(f"🔐 {e}\nThen try /analytics again.", parse_mode="Markdown")
+        except Exception as e:
+            await msg.edit_text(f"❌ Analytics failed: `{e}`\n(If permissions error → /reauth to add analytics scope)", parse_mode="Markdown")
+
+    # ------------------------------------------------------------------
+    # 🖼️ /thumbs — A/B/C thumbnail variants + pick buttons
+    # ------------------------------------------------------------------
+    async def cmd_thumbs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        import agent_features
+        raw = " ".join(context.args).strip()
+        if not raw:
+            await update.message.reply_text("Usage: `/thumbs futuristic city | FUTURE CITIES`", parse_mode="Markdown")
+            return
+        prompt, _, title = raw.partition("|")
+        prompt, title = prompt.strip(), (title.strip() or prompt.strip()[:40])
+        msg = await update.message.reply_text("🎨 Generating *3 thumbnail variants* (A/B/C)... patience 🙏")
+        engine = get_engine()
+        variants = await asyncio_to_thread(agent_features.generate_thumb_variants, engine, prompt, title, str(PRODUCTION_DIR / "ab_test"))
+        if not variants:
+            await msg.edit_text("❌ All variants failed. Check HF/Pollinations access.")
+            return
+        THUMB_MAP.clear()
+        for variant, path in variants:
+            THUMB_MAP[variant] = path
+        media = []
+        for variant, path in variants:
+            with open(path, "rb") as f:
+                from telegram import InputMediaPhoto
+                media.append(InputMediaPhoto(f.read(), caption=f"Variant {variant}"))
+        await update.message.reply_media_group(media=media)
+        buttons = [[InlineKeyboardButton(f"Use {v}", callback_data=f"ab:{v}") for v, _ in variants]]
+        await msg.edit_text("👆 Which one should I use?", reply_markup=InlineKeyboardMarkup(buttons))
+
+    async def on_thumb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        variant = query.data.split(":")[1]
+        path = THUMB_MAP.get(variant)
+        if not path or not os.path.exists(path):
+            await query.edit_message_text("⌛ Variant expired — run /thumbs again.")
+            return
+        last = agent_brain.get_last_production()
+        if last and last.get("video_path"):
+            new_path = os.path.join(os.path.dirname(last["video_path"]), "thumbnail.jpg")
+            shutil.copyfile(path, new_path)
+            agent_brain.add_history(topic=last.get("topic", ""), title=last.get("title", ""),
+                                    video_path=last["video_path"], thumb_path=new_path,
+                                    tags=last.get("tags", ""), description=last.get("description", ""),
+                                    narration=last.get("narration", ""), status="produced")
+            await query.edit_message_text(f"✅ Thumbnail *{variant}* set as final! `/upload last` will use it.", parse_mode="Markdown")
+        else:
+            await query.edit_message_text(f"✅ Saved variant {variant}: `{path}`", parse_mode="Markdown")
+
+    # ------------------------------------------------------------------
+    # 📱 /shorts — 9:16 Shorts from the last production
+    # ------------------------------------------------------------------
+    async def cmd_shorts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        import agent_features
+        last = next((h for h in agent_brain.get_history(limit=20)
+                     if h.get("video_path") and os.path.exists(h["video_path"])), None)
+        if not last:
+            await update.message.reply_text("🤔 No produced video found. `/produce <topic>` first!", parse_mode="Markdown")
+            return
+        out_path = os.path.join(os.path.dirname(last["video_path"]), "shorts_trailer.mp4")
+        msg = await update.message.reply_text(f"📱 Cutting *9:16 Shorts* from _{last.get('title') or last.get('topic')}_ ...")
+        try:
+            ok = await asyncio_to_thread(agent_features.make_shorts, get_engine(), last["video_path"], out_path, last.get("topic") or last.get("title") or "video")
+            if ok and os.path.getsize(out_path) <= MAX_TG_FILE_BYTES:
+                with open(out_path, "rb") as f:
+                    await update.message.reply_video(f, caption="📱 Vertical Shorts — ready for YouTube Shorts!", supports_streaming=True)
+                await msg.delete()
+            else:
+                await msg.edit_text("❌ Shorts generation failed or file too big.")
+        except Exception as e:
+            logger.exception("Shorts failed")
+            await msg.edit_text(f"❌ Shorts failed: `{e}`", parse_mode="Markdown")
+
+    # ------------------------------------------------------------------
+    # 🌐 /localize — multi-language versions of the last video
+    # ------------------------------------------------------------------
+    async def cmd_localize(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        import agent_features
+        langs_raw = " ".join(context.args).strip()
+        if not langs_raw:
+            await update.message.reply_text("Usage: `/localize bn,hi` — makes Bengali + Hindi versions of your last video.\nSupported: bn hi es fr de ar ja pt ru en", parse_mode="Markdown")
+            return
+        langs = [l.strip().lower() for l in langs_raw.split(",") if l.strip()][:3]
+        last = next((h for h in agent_brain.get_history(limit=20)
+                     if h.get("video_path") and os.path.exists(h["video_path"])), None)
+        if not last:
+            await update.message.reply_text("🤔 No produced video found. `/produce <topic>` first!", parse_mode="Markdown")
+            return
+        narration = last.get("narration") or last.get("description") or ""
+        if not narration:
+            await update.message.reply_text("🤔 No narration stored for that video — produce a new one first.")
+            return
+        engine = get_engine()
+        prod_dir = os.path.dirname(last["video_path"])
+        for lang in langs:
+            voice = agent_features.LANG_VOICE.get(lang)
+            msg = await update.message.reply_text(f"🌍 Making *{lang.upper()}* version (translate → voice → audio swap)...")
+            try:
+                translated = await asyncio_to_thread(engine.translate_script, narration[:3500], lang)
+                vo_path = os.path.join(prod_dir, f"voiceover_{lang}.mp3")
+                await asyncio_to_thread(engine.generate_voiceover_sync, translated, vo_path, voice)
+                out_path = os.path.join(prod_dir, f"video_{lang}.mp4")
+                ok = await asyncio_to_thread(agent_features.swap_video_audio, last["video_path"], vo_path, out_path)
+                if ok and os.path.getsize(out_path) <= MAX_TG_FILE_BYTES:
+                    with open(out_path, "rb") as f:
+                        await update.message.reply_video(f, caption=f"🌍 {lang.upper()} version — Full HD visuals, {lang} voiceover", supports_streaming=True)
+                    await msg.delete()
+                else:
+                    await msg.edit_text(f"❌ {lang.upper()} version failed or too big.")
+            except Exception as e:
+                logger.exception(f"Localization {lang} failed")
+                await msg.edit_text(f"❌ {lang.upper()} failed: `{e}`", parse_mode="Markdown")
+
+    # ------------------------------------------------------------------
+    # 🔬 /research — keyless research (Wikipedia + Google News)
+    # ------------------------------------------------------------------
+    async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        import agent_features
+        topic = " ".join(context.args).strip()
+        if not topic:
+            await update.message.reply_text("Usage: `/research quantum computing`", parse_mode="Markdown")
+            return
+        msg = await update.message.reply_text(f"🔬 Researching *{topic}* (Wikipedia + fresh news)...")
+        try:
+            result = await asyncio_to_thread(agent_features.research_topic, topic)
+            lines = [f"🔬 *Research: {topic}*\n"]
+            if result.get("wiki"):
+                lines.append(f"📚 *Wikipedia:*\n{result['wiki'][:800]}\n")
+            if result.get("news"):
+                lines.append("📰 *Latest headlines:*")
+                lines.extend(f"• {n['title']}" for n in result["news"][:6])
+            if len(lines) == 2:
+                lines.append("Nothing found — try a broader topic.")
+            lines.append("\nProduce with this research: `/produce " + topic[:80] + "`")
+            await msg.edit_text("\n".join(lines)[:4090], parse_mode="Markdown")
+        except Exception as e:
+            await msg.edit_text(f"❌ Research failed: `{e}`", parse_mode="Markdown")
+
+    # ------------------------------------------------------------------
+    # 🚨 /alerts — trend spike alert keywords
+    # ------------------------------------------------------------------
+    async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        kws = " ".join(context.args).strip()
+        if kws:
+            agent_brain.set_profile("alert_keywords", kws)
+            await update.message.reply_text(
+                f"🚨 Alert keywords saved: *{kws}*\nI check trends every 6 hours — spike korle proactively janabo!",
+                parse_mode="Markdown",
+            )
+            return
+        current = agent_brain.get_profile().get("alert_keywords", "")
+        if current:
+            await update.message.reply_text(f"🚨 Current alert keywords: *{current}*\nUpdate: `/alerts ai, space, tech`", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("🚨 *Trend Spike Alerts*\n\nI monitor Google Trends every 6 hours for your keywords and message you when something spikes 1.8x+.\n\nSet keywords:\n`/alerts artificial intelligence, space, gadgets`\n\n(Uses your niche too!)", parse_mode="Markdown")
+
+    # ------------------------------------------------------------------
+    # 🎁 /boost — engagement boost now (instead of waiting 24h)
+    # ------------------------------------------------------------------
+    async def cmd_boost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        import agent_features
+        video_id = " ".join(context.args).strip()
+        if not video_id:
+            last = next((h for h in agent_brain.get_history(limit=20) if h.get("video_id")), None)
+            video_id = last["video_id"] if last else ""
+        if not video_id:
+            await update.message.reply_text("Usage: `/boost <video_id>` (or upload first with /upload)", parse_mode="Markdown")
+            return
+        msg = await update.message.reply_text("🎁 Finding the hottest comment + crafting a personal reply...")
+        try:
+            result = await asyncio_to_thread(agent_features.engagement_boost, get_engine(), video_id)
+            stats = result.get("stats", {})
+            top = result.get("top_comment")
+            lines = [f"🎁 *{stats.get('title', video_id)}*", f"👁️ {stats.get('views', 0):,} views · 👍 {stats.get('likes', 0):,} · 💬 {stats.get('comments', 0):,}"]
+            if top:
+                lines.append(f"\n🏆 Top comment ({top['likes']} ❤️) — {top['author']}:\n\"{top['text'][:150]}\"")
+                lines.append(("↩️ Replied: _" + result.get("reply_text", "")[:150] + "_") if result.get("replied") else "⚠️ Reply post failed")
+            else:
+                lines.append("\n📭 No comments yet.")
+            await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+        except Exception as e:
+            await msg.edit_text(f"❌ Boost failed: `{e}`\n(Permissions error → /reauth)", parse_mode="Markdown")
+
+    # ------------------------------------------------------------------
+    # 🎙️ /voices — edge-tts voice selection (400+ free voices)
+    # ------------------------------------------------------------------
+    async def cmd_voices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        import agent_features
+        args = context.args or []
+        if args and args[0].lower() == "use" and len(args) >= 2:
+            voice = args[1]
+            agent_brain.set_profile("tts_voice", voice)
+            await update.message.reply_text(f"🎙️ Default voice set: *{voice}*\nAll future productions will use it!", parse_mode="Markdown")
+            return
+        lang = args[0] if args else "en"
+        msg = await update.message.reply_text(f"🎙️ Loading {lang} voices...")
+        try:
+            voices = await asyncio_to_thread(agent_features.list_edge_voices, lang, 12)
+            if not voices:
+                await msg.edit_text(f"No voices for `{lang}`. Try: en, bn, hi, es, fr, de, ar, ja, ru, pt", parse_mode="Markdown")
+                return
+            lines = [f"🎙️ *Voices for `{lang}`:*\n"] + [
+                f"• `{v['name']}` ({v['gender']})" for v in voices
+            ]
+            lines.append("\nSet default: `/voices use en-US-ChristopherNeural`\nBangla: `/voices bn`")
+            await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+        except Exception as e:
+            await msg.edit_text(f"❌ Voice list failed: `{e}`", parse_mode="Markdown")
+
+    # ------------------------------------------------------------------
+    # 🔐 /reauth — re-run headless OAuth (adds analytics scope)
+    # ------------------------------------------------------------------
+    async def cmd_reauth(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        engine = get_engine()
+        try:
+            if os.path.exists(engine.YOUTUBE_TOKEN_FILE):
+                os.remove(engine.YOUTUBE_TOKEN_FILE)
+        except Exception:
+            pass
+        if not _oauth_setup_ready():
+            await update.message.reply_text("⚠️ Set GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET (or client_secrets.json) first!", parse_mode="Markdown")
+            return
+        auth_url = engine.build_headless_auth_url()
+        PENDING_AUTH[update.effective_chat.id] = {"action": "reauth", "payload": {}}
+        await update.message.reply_text(
+            "🔐 *Fresh sign-in (with analytics scope)*\n\n1️⃣ Open:\n" + auth_url +
+            "\n\n2️⃣ Paste the full redirect URL (the one with `code=...`) here.",
+            parse_mode="Markdown",
+        )
+
+    app = (Application.builder()
+           .token(TELEGRAM_BOT_TOKEN)
+           .post_init(post_init)
+           .build())
     app.add_handler(CommandHandler(["start"], cmd_start))
     app.add_handler(CommandHandler(["help"], cmd_help))
     app.add_handler(CommandHandler(["status"], cmd_status))
@@ -841,7 +1324,18 @@ def build_application():
     app.add_handler(CommandHandler(["history"], cmd_history))
     app.add_handler(CommandHandler(["forget"], cmd_forget))
     app.add_handler(CommandHandler(["cancel"], cmd_cancel))
+    app.add_handler(CommandHandler(["schedule"], cmd_schedule))
+    app.add_handler(CommandHandler(["analytics"], cmd_analytics))
+    app.add_handler(CommandHandler(["thumbs"], cmd_thumbs))
+    app.add_handler(CommandHandler(["shorts"], cmd_shorts))
+    app.add_handler(CommandHandler(["localize"], cmd_localize))
+    app.add_handler(CommandHandler(["research"], cmd_research))
+    app.add_handler(CommandHandler(["alerts"], cmd_alerts))
+    app.add_handler(CommandHandler(["boost"], cmd_boost))
+    app.add_handler(CommandHandler(["voices"], cmd_voices))
+    app.add_handler(CommandHandler(["reauth"], cmd_reauth))
     app.add_handler(CallbackQueryHandler(on_suggestion_tap, pattern="^(p|s)\\d+$"))
+    app.add_handler(CallbackQueryHandler(on_thumb_pick, pattern="^ab:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_chat))
     return app
 
