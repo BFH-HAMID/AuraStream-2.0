@@ -27,6 +27,9 @@ AuraStream is a complete, fully-automated YouTube AI Agent with **Hugging Face S
 18. **🧠 Hybrid AI Fallback:** If Gemini fails, automatically falls back to Mistral-7B/Zephyr-7B via HF - never fails!
 19. **✨ Enhanced Prompt Engineering:** HF LLM enhances thumbnail prompts for viral results
 20. **🔊 MMS-TTS Multilingual:** 1100+ languages TTS for truly global content
+21. **🤖 Telegram AI Agent:** A full conversational AI agent on Telegram — run the entire studio from your phone (`/produce`, `/script`, `/trends`, free-text AI chat) → `telegram_agent.py`
+22. **🎞️ 1080p Full HD Engine:** Footage is auto-selected at exactly **1920×1080** (Pexels/Pixabay best-rendition picker), every clip is scale+cropped to Full HD, rendered at 30fps H.264 with adaptive 8 Mbps bitrate
+23. **🐳 Dockerfile Ready:** One-command deployment — `docker compose up` for the dashboard, `docker compose --profile agent up` to also run the Telegram AI Agent
 
 ## 🤔 Why Hugging Face Makes It More Advanced?
 
@@ -57,6 +60,51 @@ AuraStream is a complete, fully-automated YouTube AI Agent with **Hugging Face S
    - Telegram (optional)
 
 4. Download your `client_secrets.json` from the Google Cloud Console (with YouTube Data API v3 enabled) and place it in the root directory.
+
+## 🐳 Docker (Recommended — Ready Out of the Box)
+
+```bash
+cp .env.example .env        # add your API keys
+
+# Streamlit dashboard only
+docker compose up web
+
+# Dashboard + Telegram AI Agent together
+docker compose --profile agent up
+
+# Rebuild after code changes
+docker compose up --build
+```
+
+The image uses **CPU-only PyTorch** (2.5 GB smaller), ships with ffmpeg + fonts, exposes a healthcheck on `http://localhost:8501/_stcore/health`, and persists renders/models in volumes (`temp_assets/`, `hf-cache`).
+
+## 🤖 Telegram AI Agent
+
+Control the whole studio from your phone:
+
+1. Talk to **@BotFather** on Telegram → `/newbot` → copy the token
+2. Add to `.env`: `TELEGRAM_BOT_TOKEN=123456:ABC-DEF...`
+3. Run: `python telegram_agent.py` (or `docker compose --profile agent up agent`)
+
+| Command | What it does |
+|---|---|
+| `/produce <topic>` | 🎬 **Full autopilot**: script → voiceover → **1080p Full HD video** → AI thumbnail → delivered into the chat |
+| `/script <topic>` | Full script + SEO metadata (Gemini → HF Mistral fallback) |
+| `/trends [region]` | Trending topic ideas from Google Trends |
+| `/thumbnail <prompt> \| <title>` | AI thumbnail (SDXL → Pollinations) |
+| `/translate <lang> <text>` | Translation via NLLB-200 → Gemini (200+ languages) |
+| `/sentiment <text>` | Comment sentiment + emotion analysis |
+| `/status` | API key & engine status |
+| Just type anything | 💬 Free-text AI chat — with "make a video about X" intent detection that triggers a full production |
+
+Progress updates are edited live in the chat while the 1080p render runs, and the finished video + thumbnail + `script.json` are sent straight back to you.
+
+## 🎞️ 1080p Full HD Engine
+
+- **Smart source picking:** prefers the exact 1920×1080 rendition from Pexels, else the smallest resolution *above* 1080p (downscaling preserves sharpness), Pixabay `large` rendition as fallback
+- **Uniform render:** every clip is scale + center-cropped to 1920×1080 @ 30fps, no black bars or mixed resolutions
+- **Adaptive bitrate:** 8 Mbps for 1080p, 5 Mbps for 720p, H.264 + AAC
+- Switch resolution in the dashboard sidebar ("Video Resolution") or via the Telegram agent (always Full HD)
 
 ## 🎯 Usage
 
@@ -115,9 +163,11 @@ User Topic → [Trends API]
 ## 📦 New Files Added
 
 - `hf_engine.py` - Complete Hugging Face engine with 10+ SOTA models
-- Updated `app.py` - Hybrid AI pipeline with HF integration
-- Updated `.env.example` - Includes HF API key
-- Updated `requirements.txt` - Includes HF libraries
+- `telegram_agent.py` - 🤖 Full Telegram AI Agent (chat + autopilot 1080p productions)
+- `Dockerfile` + `docker-compose.yml` + `.dockerignore` - 🐳 Production-ready Docker deployment
+- Updated `app.py` - Hybrid AI pipeline + 1080p Full HD render engine
+- Updated `.env.example` - Includes HF API key + Telegram agent setup guide
+- Updated `requirements.txt` - Includes HF libraries + python-telegram-bot
 
 ## 🌟 Demo - What HF Adds
 

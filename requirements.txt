@@ -10,6 +10,7 @@ google-auth-httplib2
 pytrends
 streamlit
 python-dotenv
+python-telegram-bot>=21.0
 numpy<2.0
 imageio
 imageio-ffmpeg

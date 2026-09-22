@@ -1,0 +1,39 @@
+# ==============================================================================
+# AuraStream 2.0 — Docker Compose
+#
+#   Web dashboard only:   docker compose up web
+#   + Telegram AI Agent:  docker compose --profile agent up
+# ==============================================================================
+
+services:
+  # Streamlit web dashboard (default)
+  web:
+    build: .
+    image: aurastream:latest
+    container_name: aurastream-web
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      - ./temp_assets:/app/temp_assets          # rendered videos + clips
+      - hf-cache:/app/.cache/huggingface        # whisper / SDXL / MusicGen models
+      # - ./client_secrets.json:/app/client_secrets.json:ro  # YouTube upload (optional)
+    restart: unless-stopped
+
+  # Telegram AI Agent (opt-in via the "agent" profile)
+  agent:
+    build: .
+    image: aurastream:latest
+    container_name: aurastream-agent
+    command: python telegram_agent.py
+    env_file:
+      - .env
+    volumes:
+      - ./temp_assets:/app/temp_assets
+      - hf-cache:/app/.cache/huggingface
+    profiles: ["agent"]
+    restart: unless-stopped
+
+volumes:
+  hf-cache:

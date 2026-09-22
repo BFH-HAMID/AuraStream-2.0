@@ -208,10 +208,42 @@ def generate_voiceover_sync(text: str, output_path: str):
         loop.close()
 
 # ==============================================================================
-# 3. Dual Fallback Video Downloader Prompt
+# 3. Dual Fallback Video Downloader - 1080p FULL HD ENGINE
 # ==============================================================================
-def download_bulk_videos(keywords: list) -> list:
-    """Download stock footage with Pexels primary and Pixabay fallback."""
+# Supported quality modes: "1080p" (Full HD, default), "720p" (HD), "best" (max available)
+def _pick_pexels_video_file(video_files: list, quality: str = "1080p"):
+    """Select the best Pexels video file for the requested quality (Full HD aware)."""
+    files = [f for f in video_files if f.get("height")]
+    if not files:
+        return None
+    target = 720 if quality == "720p" else 1080
+    # 1) Exact match (e.g. exactly 1920x1080 Full HD)
+    exact = [f for f in files if f.get("height") == target]
+    if exact:
+        return exact[0]
+    # 2) Next resolution ABOVE target (downscaling loses less quality than upscaling)
+    higher = [f for f in files if f.get("height", 0) > target]
+    if higher:
+        return sorted(higher, key=lambda f: f.get("height", 0))[0]
+    # 3) Largest available as last resort
+    return sorted(files, key=lambda f: f.get("height", 0), reverse=True)[0]
+
+
+def _pick_pixabay_video_file(videos: dict, quality: str = "1080p"):
+    """Select the best Pixabay rendition for the requested quality (Full HD aware)."""
+    if quality == "720p":
+        chain = ["medium", "large", "small"]
+    else:
+        # 1080p / best: prefer the large (typically 1920x1080 Full HD) rendition
+        chain = ["large", "medium", "small"]
+    for size in chain:
+        if videos.get(size, {}).get("url"):
+            return videos[size]["url"], videos[size]
+    return None, None
+
+
+def download_bulk_videos(keywords: list, quality: str = "1080p") -> list:
+    """Download stock footage (1080p Full HD by default) with Pexels primary and Pixabay fallback."""
     if not keywords:
         logger.warning("No keywords provided for video download")
         return []
@@ -219,6 +251,8 @@ def download_bulk_videos(keywords: list) -> list:
     if not PEXELS_API_KEY and not PIXABAY_API_KEY:
         logger.warning("Both PEXELS and PIXABAY API keys missing, cannot download videos")
         return []
+
+    logger.info(f"Downloading stock footage at quality mode: {quality.upper()}")
 
     downloaded_paths = []
 
@@ -242,15 +276,12 @@ def download_bulk_videos(keywords: list) -> list:
 
                 if data.get("videos"):
                     video_files = data["videos"][0].get("video_files", [])
-                    if video_files:
-                        # Prefer 1080p, else highest
-                        hd_file = next((f for f in video_files if f.get("height") == 1080), None)
-                        if not hd_file:
-                            # Sort by height descending
-                            hd_file = sorted(video_files, key=lambda x: x.get("height", 0), reverse=True)[0]
+                    hd_file = _pick_pexels_video_file(video_files, quality)
+                    if hd_file:
                         video_url = hd_file.get("link")
+                        resolution = f"{hd_file.get('width', '?')}x{hd_file.get('height', '?')}"
                         if video_url:
-                            vid_res = requests.get(video_url, stream=True, timeout=20)
+                            vid_res = requests.get(video_url, stream=True, timeout=30)
                             vid_res.raise_for_status()
                             with open(output_path, 'wb') as f:
                                 for chunk in vid_res.iter_content(chunk_size=8192):
@@ -259,7 +290,7 @@ def download_bulk_videos(keywords: list) -> list:
                             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                                 downloaded_paths.append(output_path)
                                 success = True
-                                logger.info(f"Pexels success for '{keyword}' -> {output_path}")
+                                logger.info(f"Pexels success for '{keyword}' [{resolution}] -> {output_path}")
             except Exception as e:
                 logger.warning(f"Pexels failed for '{keyword}': {e}")
 
@@ -272,13 +303,11 @@ def download_bulk_videos(keywords: list) -> list:
                 data = res.json()
 
                 if data.get("hits"):
-                    # Try first hit with large video
                     for hit in data["hits"]:
                         videos = hit.get("videos", {})
-                        large = videos.get("large", {}) or videos.get("medium", {}) or videos.get("small", {})
-                        video_url = large.get("url")
+                        video_url, rendition = _pick_pixabay_video_file(videos, quality)
                         if video_url:
-                            vid_res = requests.get(video_url, stream=True, timeout=20)
+                            vid_res = requests.get(video_url, stream=True, timeout=30)
                             vid_res.raise_for_status()
                             with open(output_path, 'wb') as f:
                                 for chunk in vid_res.iter_content(chunk_size=8192):
@@ -287,7 +316,8 @@ def download_bulk_videos(keywords: list) -> list:
                             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                                 downloaded_paths.append(output_path)
                                 success = True
-                                logger.info(f"Pixabay success for '{keyword}' -> {output_path}")
+                                if rendition:
+                                    logger.info(f"Pixabay success for '{keyword}' [{rendition.get('width', '?')}x{rendition.get('height', '?')}] -> {output_path}")
                                 break
             except Exception as e:
                 logger.warning(f"Pixabay fallback failed for '{keyword}': {e}")
@@ -295,14 +325,36 @@ def download_bulk_videos(keywords: list) -> list:
     return downloaded_paths
 
 # ==============================================================================
-# 4. MoviePy Video & Subtitle Assembler Prompt
+# 4. MoviePy Video & Subtitle Assembler - 1080p FULL HD Prompt
 # ==============================================================================
-def create_mega_production(clips_paths: list, audio_path: str, title: str, output_path: str):
-    """Assemble final video with voiceover and word-level subtitles (MoviePy 2.x compatible)."""
+def _fit_clip_to_resolution(clip, target_resolution):
+    """Scale + center-crop a clip to exactly fill target_resolution (w, h). MoviePy 1.x & 2.x compatible."""
+    tw, th = target_resolution
+    try:
+        scale = max(tw / max(clip.w, 1), th / max(clip.h, 1))
+        if MOVIEPY_V2:
+            clip = clip.resized(scale)
+        else:
+            clip = clip.resize(newsize=(max(1, int(clip.w * scale)), max(1, int(clip.h * scale))))
+        x1 = max(0, (clip.w - tw) // 2)
+        y1 = max(0, (clip.h - th) // 2)
+        if MOVIEPY_V2:
+            clip = clip.cropped(x1=x1, y1=y1, width=min(tw, clip.w), height=min(th, clip.h))
+        else:
+            clip = clip.crop(x1=x1, y1=y1, width=min(tw, clip.w), height=min(th, clip.h))
+    except Exception as e:
+        logger.warning(f"Could not fit clip to {target_resolution}: {e}")
+    return clip
+
+
+def create_mega_production(clips_paths: list, audio_path: str, title: str, output_path: str, target_resolution=(1920, 1080)):
+    """Assemble final 1080p Full HD video with voiceover and word-level subtitles (MoviePy 2.x compatible)."""
     if not clips_paths:
         raise ValueError("No video clips provided")
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+    logger.info(f"Assembling production at target resolution: {target_resolution[0]}x{target_resolution[1]}")
 
     audio = AudioFileClip(audio_path)
     audio_duration = audio.duration
@@ -319,6 +371,12 @@ def create_mega_production(clips_paths: list, audio_path: str, title: str, outpu
                 clip = clip.without_audio()
             else:
                 clip = clip.without_audio()
+            # Normalize every clip to the target resolution (1080p Full HD) and 30fps
+            clip = _fit_clip_to_resolution(clip, target_resolution)
+            if MOVIEPY_V2:
+                clip = clip.with_fps(30)
+            else:
+                clip = clip.set_fps(30)
             clips.append(clip)
             current_duration += clip.duration
             if current_duration >= audio_duration:
@@ -405,13 +463,15 @@ def create_mega_production(clips_paths: list, audio_path: str, title: str, outpu
     else:
         mega_production = final_video
 
-    # Write final video
+    # Write final video - adaptive bitrate for crisp Full HD output
+    render_bitrate = "5000k" if target_resolution[1] <= 720 else "8000k"
     try:
         mega_production.write_videofile(
             output_path,
             codec="libx264",
             fps=30,
             audio_codec="aac",
+            bitrate=render_bitrate,
             logger=None
         )
     finally:
@@ -1011,7 +1071,9 @@ def run_streamlit_dashboard():
         st.write(f"HuggingFace: {'✅' if HUGGINGFACE_API_KEY and HUGGINGFACE_API_KEY != 'your_huggingface_api_key_here' else '❌ Missing'}")
         st.write(f"Pexels: {'✅' if PEXELS_API_KEY and PEXELS_API_KEY != 'your_pexels_api_key_here' else '❌ Missing'}")
         st.write(f"Pixabay: {'✅' if PIXABAY_API_KEY and PIXABAY_API_KEY != 'your_pixabay_api_key_here' else '❌ Missing'}")
-        st.write(f"Telegram: {'✅' if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != 'your_telegram_bot_token_here' else '⚠️ Optional'}")
+        st.write(f"Telegram Alerts: {'✅' if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != 'your_telegram_bot_token_here' else '⚠️ Optional'}")
+        st.write(f"Telegram AI Agent: {'✅ Ready' if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != 'your_telegram_bot_token_here' else '❌ No bot token'}")
+        st.caption("Run agent: `python telegram_agent.py`")
         st.divider()
         
         # HF Advanced Settings
@@ -1067,13 +1129,22 @@ def run_streamlit_dashboard():
     else:
         final_topic = st.text_input("Video Topic", placeholder="Enter your topic...", key="manual_topic")
 
-    col_a, col_b, col_c = st.columns(3)
+    col_a, col_b, col_c, col_d = st.columns(4)
     with col_a:
         duration = st.slider("Video Duration (mins)", min_value=1, max_value=10, value=3)
     with col_b:
         language = st.selectbox("Language", ["English", "Bengali", "Hindi", "Spanish", "French", "German", "Arabic", "Japanese"])
     with col_c:
         quality = st.selectbox("Quality Mode", ["balanced", "speed", "ultra-quality"], index=0, help="Ultra-quality uses HF SDXL + MusicGen (slower but better)")
+    with col_d:
+        video_quality = st.selectbox(
+            "Video Resolution",
+            ["1080p Full HD (Recommended)", "720p HD", "Best Available"],
+            index=0,
+            help="1080p Full HD downloads + renders in 1920x1080 with adaptive bitrate"
+        )
+    resolution_map = {"1080p Full HD (Recommended)": "1080p", "720p HD": "720p", "Best Available": "best"}
+    selected_video_quality = resolution_map[video_quality]
 
     # Advanced options expander
     with st.expander("⚙️ Advanced AI Options", expanded=False):
@@ -1107,7 +1178,7 @@ def run_streamlit_dashboard():
         if hf_enabled and (not HUGGINGFACE_API_KEY or HUGGINGFACE_API_KEY == "your_huggingface_api_key_here"):
             st.warning("HF enabled but API key missing - will use public rate limits (slower)")
 
-        st.info(f"Pipeline started for topic: **{final_topic}** | Mode: {quality} | HF: {'✅' if hf_enabled else '❌'}")
+        st.info(f"Pipeline started for topic: **{final_topic}** | Mode: {quality} | Resolution: **{video_quality}** | HF: {'✅' if hf_enabled else '❌'}")
         progress_bar = st.progress(0)
         status_text = st.empty()
 
@@ -1203,7 +1274,7 @@ def run_streamlit_dashboard():
             if not keywords:
                 keywords = final_topic.split()[:10]
 
-            clips = download_bulk_videos(keywords[:15])
+            clips = download_bulk_videos(keywords[:15], quality=selected_video_quality)
             if not clips:
                 st.warning("No stock footage downloaded, check Pexels/Pixabay keys")
                 st.error("Cannot assemble video without footage.")
@@ -1211,7 +1282,8 @@ def run_streamlit_dashboard():
 
             progress_bar.progress(60)
             main_video_path = str(TEMP_DIR / "main_video.mp4")
-            create_mega_production(clips, voiceover_path, script_data.get("title", final_topic), main_video_path)
+            target_resolution = (1280, 720) if selected_video_quality == "720p" else (1920, 1080)
+            create_mega_production(clips, voiceover_path, script_data.get("title", final_topic), main_video_path, target_resolution=target_resolution)
             progress_bar.progress(70)
             if os.path.exists(main_video_path):
                 st.video(main_video_path)
