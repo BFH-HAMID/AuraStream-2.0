@@ -74,6 +74,7 @@ app_port: 8501
 | Space **restart** hole file haray | `token.pickle`, agent memory reset | Re-auth koro (`/upload`), profile abar `/settings` diye dao |
 | Long render er somoy bot ta reply kore na | — | Normal — rendering background e cholche, progress message update hoy |
 | Space restart hole **schedules** (auto-pilot) o reset hoy | APScheduler in-memory | `/schedule` abar set koro (ek line) |
+| Voice note pathale prothom bar Whisper model (~150 MB) download hoy | One-time | Cache e thake — erpor instant |
 
 ## Local vs Space
 

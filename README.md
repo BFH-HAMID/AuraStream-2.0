@@ -30,6 +30,13 @@ AuraStream is a complete, fully-automated YouTube AI Agent with **Hugging Face S
 21. **🤖 Telegram AI Agent (with persistent memory):** A full conversational AI agent on Telegram that *knows your channel* — channel profile, custom instructions, facts, full video history stored in SQLite. `/produce`, `/suggest` (trend analysis + tap-to-produce buttons), `/upload` (headless YouTube OAuth), `/comments` (sentiment-aware auto-replies), `/settings`, `/remember`, `/history`, free-text chat with intent detection → `telegram_agent.py` + `agent_brain.py`
 22. **🎞️ 1080p Full HD Engine:** Footage is auto-selected at exactly **1920×1080** (Pexels/Pixabay best-rendition picker), every clip is scale+cropped to Full HD, rendered at 30fps H.264 with adaptive 8 Mbps bitrate
 24. **⏰ Auto-Pilot Pack (ALL FREE):** `/schedule daily 18:00` auto-productions with auto-upload · `/analytics` YouTube performance reports · `/shorts` 9:16 Shorts · `/localize bn,hi` multi-language versions · `/thumbs` A/B/C thumbnail testing · `/research` facts from Wikipedia + Google News woven into scripts · `/alerts` proactive trend-spike notifications · `/boost` top-comment engagement replies · `/voices` 400+ free neural voices · `/reauth` fresh sign-in
+25. **🎙️ Voice Control:** Send a Telegram voice note ("make a video about black holes") — local Whisper transcribes and the agent routes the intent, hands-free
+26. **📝 Auto CC Captions:** Word-timed .srt generated during render and auto-uploaded to YouTube as closed captions (free SEO + accessibility boost)
+27. **🧮 SEO Scorer:** `/seo` grades title/description/tags 0-100 with actionable checks + AI improved title
+28. **🛡️ Pre-Upload Safety Audit:** `/safety` checks policy/copyright/demonetization risks before publishing
+29. **📅 Best Time to Post:** `/besttime` finds the hour your viewers actually watch (Analytics per-hour data)
+30. **📊 Weekly Digest:** Auto-report every Sunday — weekly performance + 5 fresh topic ideas (`/digest on/off`)
+31. **📺 Breaking-News Auto-Produce:** `/news on upload` scans news every 2h and auto-produces (and uploads) videos on fresh niche stories
 23. **🐳 Dockerfile Ready:** One-command deployment — `docker compose up` for the dashboard, `docker compose --profile agent up` to also run the Telegram AI Agent, or `RUN_TELEGRAM_AGENT=true` for both in one container (**HF Space ready** — see `DEPLOY_HF_SPACE.md`)
 
 ## 🤔 Why Hugging Face Makes It More Advanced?
@@ -93,6 +100,7 @@ Control the whole studio from your phone — and the agent **remembers your chan
 | `/produce <topic>` | 🎬 **Full autopilot**: script → voiceover → **1080p Full HD video** → AI thumbnail → delivered into the chat (remembered for `/upload`) |
 | `/upload [last\|id]` | ⬆️ **Uploads to YouTube** — headless OAuth: bot sends a Google sign-in link, you paste the redirect URL back, done. Token saved for reuse |
 | `/comments [video_id] [max]` | 💬 **Reads comments, analyzes sentiment + emotion, writes empathetic auto-replies**, reports a summary |
+| *(auto)* 📝 **CC captions** | Every upload also posts the auto-generated .srt as closed captions (SEO boost) |
 | `/settings` | ⚙️ Teach the agent your channel: `/settings set niche tech reviews`, `/settings set tone funny`, `/settings custom always open with a shocking fact` |
 | `/remember <fact>` | 🧠 "my audience loves short tutorials" — used in every future script/reply/suggestion |
 | `/history` | 📚 Every produced/uploaded video with links |
@@ -113,6 +121,12 @@ Control the whole studio from your phone — and the agent **remembers your chan
 | `/boost [video_id]` | 🎁 Finds the most-liked comment, replies personally (YouTube API cannot pin — this is the next best thing), sends stats |
 | `/voices [lang]` | 🎙️ 400+ free Edge-TTS voices (Bangla `bn-BD` included) — `/voices use <name>` sets the default |
 | `/reauth` | 🔐 Fresh YouTube sign-in (adds the analytics scope) |
+| **🎙️ Voice note** | Just hold and speak — "make a video about black holes" — Whisper (local, free) transcribes and the agent acts |
+| `/seo <title> \| <desc> \| <tags>` | 🧮 SEO score /100 with checks + AI improved title & tips (`/seo last` for the last production) |
+| `/safety last` | 🛡️ Policy/copyright/demonetization audit before upload (Gemini + offline keyword heuristic) |
+| `/besttime [days]` | 📅 Per-hour viewer activity histogram + suggested `/schedule` time |
+| `/digest [on\|off]` | 📊 Weekly digest every Sunday 18:00: analytics + 5 topic ideas + pre-upload checklist |
+| `/news on [upload]` | 📺 **Breaking-News Mode**: scans Google News every 2h, auto-produces a 1080p video on fresh stories (add `upload` to auto-publish) |
 | Just type anything | 💬 Free-text chat **with full memory context** — "make a video about X", "suggest topics", "upload my last video", "reply to comments" all work as plain sentences |
 
 **Agent memory (`agent_brain.py`):** SQLite database storing channel profile, custom instructions, learned facts, production history and suggestions. Every AI reply (chat, scripts, suggestions) is conditioned on this context — the more you use it, the more personalized it gets. Override location with `AGENT_MEMORY_DB`.

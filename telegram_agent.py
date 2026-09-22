@@ -88,6 +88,29 @@ def get_engine():
 
 
 # ---------------------------------------------------------------------------
+# Voice-note transcription (local Whisper — free, private)
+# ---------------------------------------------------------------------------
+_WHISPER_MODEL = None
+
+
+def get_whisper_model():
+    """Lazy-load the local Whisper model for voice-note transcription."""
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is None:
+        import whisper_timestamped as whisper
+        logger.info("Loading Whisper model for voice notes (first run downloads ~150 MB)...")
+        _WHISPER_MODEL = whisper.load_model("base")
+    return _WHISPER_MODEL
+
+
+def transcribe_voice(path: str) -> str:
+    """Transcribe an ogg/opus Telegram voice note to text."""
+    import whisper_timestamped as whisper
+    result = whisper.transcribe(get_whisper_model(), path)
+    return (result.get("text") or "").strip()
+
+
+# ---------------------------------------------------------------------------
 # AI helpers (Gemini primary, HF fallback) — with full agent memory context
 # ---------------------------------------------------------------------------
 GEMINI_CHAT_MODEL = "gemini-2.5-flash"
@@ -393,6 +416,17 @@ async def perform_upload(bot, chat_id: int, item: dict):
             parse_mode="Markdown",
         )
         engine.send_telegram_message(f"🚀 AuraStream: '{meta['title']}' is LIVE → https://youtube.com/watch?v={video_id}")
+        # Auto-upload .srt captions (SEO boost) if the SRT sits next to the video
+        try:
+            srt_path = os.path.splitext(item["video_path"])[0] + ".srt"
+            if os.path.exists(srt_path):
+                lang = (agent_brain.get_profile().get("language") or "en")[:2].lower()
+                caption_lang = lang if lang in ("en", "bn", "hi", "es", "fr", "de", "ar", "ja", "pt", "ru") else "en"
+                cap_ok = await asyncio_to_thread(engine.upload_captions_to_youtube, video_id, srt_path, caption_lang)
+                if cap_ok:
+                    await bot.send_message(chat_id, "📝 CC captions uploaded to YouTube (SEO boost!)")
+        except Exception as e:
+            logger.warning(f"Caption upload failed: {e}")
         # Schedule the 24h engagement booster (top-comment reply + stats report)
         try:
             if SCHEDULER is not None:
@@ -524,17 +558,98 @@ async def scheduled_trend_alert_job():
             logger.warning(f"Trend alert send failed: {e}")
 
 
+async def build_weekly_digest() -> str:
+    """Weekly digest: analytics summary + 5 fresh topic ideas + checklist."""
+    import agent_features
+    lines = ["📊 *Your Weekly Digest*\n"]
+    try:
+        report = await asyncio_to_thread(agent_features.fetch_analytics_report, get_engine(), 7)
+        lines.append(report["summary"].split("💡")[0].strip())
+    except Exception as e:
+        lines.append(f"📊 Analytics unavailable: `{str(e)[:90]}`")
+    try:
+        sugs = await asyncio_to_thread(agent_brain.suggest_topics,
+                                       agent_brain.get_profile().get("region", "united_states"), 5)
+        lines.append("\n💡 *Next week's topic ideas:*")
+        lines.extend(f"{i}. {s['topic']} _({s['score']}/10)_" for i, s in enumerate(sugs, 1))
+    except Exception as e:
+        lines.append(f"💡 Suggestions unavailable: `{str(e)[:90]}`")
+    lines.append("\n🛡️ Pre-upload checklist: `/safety last` • `/seo last`")
+    return "\n".join(lines)
+
+
+async def weekly_digest_job():
+    """Every Sunday 18:00 (SCHEDULER_TZ): send the digest to the last active chat."""
+    import agent_brain
+    if BOT_REF is None or agent_brain.kv_get("digest_enabled", "1") != "1":
+        return
+    chat_id_raw = agent_brain.kv_get("last_chat_id", "")
+    if not chat_id_raw:
+        return
+    try:
+        digest = await build_weekly_digest()
+        await BOT_REF.send_message(int(chat_id_raw), digest[:4090], parse_mode="Markdown")
+    except Exception as e:
+        logger.warning(f"Weekly digest failed: {e}")
+
+
+async def breaking_news_job():
+    """Every 2h: if news mode is on, scan niche news; on fresh items auto-produce (+upload)."""
+    import agent_brain
+    import agent_features
+    if BOT_REF is None or agent_brain.kv_get("news_mode", "0") != "1":
+        return
+    chat_id_raw = agent_brain.kv_get("last_chat_id", "")
+    if not chat_id_raw:
+        return
+    profile = agent_brain.get_profile()
+    kws = [k.strip() for k in (profile.get("alert_keywords") or "").split(",") if k.strip()]
+    if profile.get("niche"):
+        kws.append(profile["niche"])
+    if not kws:
+        return
+    seen = [s for s in agent_brain.kv_get("news_seen", "").split("|||") if s][-100:]
+    try:
+        fresh = await asyncio_to_thread(agent_features.check_breaking_news, kws, seen, 26.0)
+    except Exception as e:
+        logger.warning(f"News scan failed: {e}")
+        return
+    if not fresh:
+        return
+    topic = fresh[0]["title"][:110]
+    all_seen = seen + [f["title"] for f in fresh]
+    agent_brain.kv_set("news_seen", "|||".join(all_seen[-120:]))
+    try:
+        await BOT_REF.send_message(
+            int(chat_id_raw),
+            f"🚨 *BREAKING:* {topic}\n\n📺 Auto-producing a full 1080p video on this now!",
+            parse_mode="Markdown",
+        )
+        await run_full_production(BOT_REF, int(chat_id_raw), topic)
+        if agent_brain.kv_get("news_auto_upload", "0") == "1":
+            item = agent_brain.get_last_production()
+            if item and item.get("video_path") and item.get("status") == "produced":
+                await perform_upload(BOT_REF, int(chat_id_raw), item)
+    except Exception as e:
+        logger.exception("Breaking news production failed")
+
+
 async def post_init(app):
     """PTB post-init: start the scheduler, register jobs, keep the bot ref."""
     global BOT_REF
     BOT_REF = app.bot
     register_schedule_jobs()
     if SCHEDULER is not None:
+        from apscheduler.triggers.cron import CronTrigger
         from apscheduler.triggers.interval import IntervalTrigger
         SCHEDULER.add_job(scheduled_trend_alert_job, IntervalTrigger(hours=6),
                           id="trend_alerts", misfire_grace_time=3600)
+        SCHEDULER.add_job(breaking_news_job, IntervalTrigger(hours=2),
+                          id="breaking_news", misfire_grace_time=3600)
+        SCHEDULER.add_job(weekly_digest_job, CronTrigger(day_of_week="sun", hour=18, minute=0),
+                          id="weekly_digest", misfire_grace_time=3600)
         SCHEDULER.start()
-        logger.info("⏰ Auto-pilot scheduler started (productions + trend alerts)")
+        logger.info("⏰ Scheduler started: productions + trend alerts + breaking news + weekly digest")
     else:
         logger.warning("APScheduler not installed — /schedule disabled (pip install apscheduler)")
 
@@ -597,7 +712,13 @@ def build_application():
             "/alerts \<keywords\> — 🚨 trend spike alerts\n"
             "/boost \[video\_id\] — 🎁 top\-comment engagement reply\n"
             "/voices \[lang\] — 🎙️ voice catalogue (400+)\n"
-            "/reauth — 🔐 fresh YouTube sign\-in\n\n"
+            "/reauth — 🔐 fresh YouTube sign\-in\n"
+            "/seo \\<title\\> \\| \\<desc\\> \\| \\<tags\\> — 🧮 SEO score + AI improvements\n"
+            "/safety last — 🛡️ policy/copyright audit before upload\n"
+            "/besttime — 📅 when your viewers watch most\n"
+            "/digest \\[on/off\\] — 📊 weekly report (Sunday 18:00)\n"
+            "/news on \\[upload\\] — 📺 breaking-news auto-produce\n"
+            "🎙️ *Send a voice note* — I understand speech!\n"
             "_Free text works too — I understand intents._",
             parse_mode="MarkdownV2",
         )
@@ -932,7 +1053,6 @@ def build_application():
         text = (update.message.text or "").strip()
         chat_id = update.effective_chat.id
         agent_brain.kv_set("last_chat_id", str(chat_id))
-        lowered = text.lower()
 
         # 1) Waiting for an OAuth code?
         if chat_id in PENDING_AUTH:
@@ -964,7 +1084,12 @@ def build_application():
                 await update.message.reply_text("⏳ I'm still waiting for your Google sign-in code (the URL containing `code=...`). Or type /cancel.", parse_mode="Markdown")
                 return
 
-        # 2) Intent routing (keyword fast-path + LLM fallback)
+        await route_and_execute(update, context, text)
+
+    async def route_and_execute(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+        """Shared intent dispatcher — used by free text AND voice notes."""
+        lowered = text.lower()
+        # Intent routing (keyword fast-path + LLM fallback)
         routed = await asyncio_to_thread(agent_brain.route_intent, text, True)
         intent = routed["intent"]
         args = routed.get("args", text)
@@ -999,12 +1124,208 @@ def build_application():
             await cmd_status(update, context)
         elif intent == "settings":
             await cmd_settings(update, context)
+        elif intent == "seo":
+            await cmd_seo(update, context)
+        elif intent == "safety":
+            await cmd_safety(update, context)
+        elif intent == "besttime":
+            await cmd_besttime(update, context)
+        elif intent == "digest":
+            await cmd_digest(update, context)
+        elif intent == "news":
+            await cmd_news(update, context)
         else:
             await update.message.chat.send_action(ChatAction.TYPING)
             reply = await asyncio_to_thread(ai_chat_reply, text)
             if len(reply) > 4096:
                 reply = reply[:4090] + "…"
             await update.message.reply_text(reply)
+
+    # ------------------------------------------------------------------
+    # 🎙️ Voice notes — talk to the agent (Whisper transcribe -> intent)
+    # ------------------------------------------------------------------
+    async def on_voice_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        agent_brain.kv_set("last_chat_id", str(chat_id))
+        voice = update.message.voice or update.message.audio
+        if not voice:
+            await update.message.reply_text("❌ No voice note found.")
+            return
+        msg = await update.message.reply_text("🎙️ Listening...")
+        path = os.path.join(tempfile.gettempdir(), f"tg_voice_{chat_id}_{int(time.time())}.ogg")
+        try:
+            tg_file = await voice.get_file()
+            await tg_file.download_to_drive(path)
+            await msg.edit_text("🧠 Transcribing with Whisper (local, free)...")
+            text = await asyncio_to_thread(transcribe_voice, path)
+            if not text:
+                await msg.edit_text("🤔 Could not understand the audio — try speaking a bit slower?")
+                return
+            await msg.edit_text(f"🗣️ You said: _{text[:300]}_", parse_mode="Markdown")
+            await route_and_execute(update, context, text)
+        except Exception as e:
+            logger.exception("Voice note failed")
+            await msg.edit_text(f"❌ Voice processing failed: `{e}`\n(First use downloads the Whisper model ~150MB)", parse_mode="Markdown")
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # 🧮 /seo — metadata score 0-100 + AI improvements
+    # ------------------------------------------------------------------
+    async def cmd_seo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        import agent_features
+        raw = " ".join(context.args).strip()
+        if not raw or raw.lower() == "last":
+            last = agent_brain.get_last_production()
+            if not last:
+                await update.message.reply_text(
+                    "Usage: `/seo <title> | <description> | <tag1, tag2>`\nOr score your last production: `/seo last`",
+                    parse_mode="Markdown",
+                )
+                return
+            title = last.get("title") or ""
+            desc = last.get("description") or ""
+            tags = last.get("tags") or ""
+        else:
+            parts = raw.split("|")
+            title = parts[0].strip()
+            desc = parts[1].strip() if len(parts) > 1 else ""
+            tags = parts[2].strip() if len(parts) > 2 else ""
+        if not title:
+            await update.message.reply_text("Give at least a title: `/seo my title | description | tag1, tag2`", parse_mode="Markdown")
+            return
+        msg = await update.message.reply_text("🧮 Scoring SEO (heuristic + AI tips)...")
+        try:
+            result = await asyncio_to_thread(agent_features.seo_score, get_engine(), title, desc, tags)
+            lines = [f"🧮 *SEO Score: {result['score']}/100 — Grade {result['grade']}*\n"]
+            for c in result["checks"]:
+                lines.append(f"{'✅' if c['ok'] else '❌'} {c['check']} ({c['points']}/{c['max']})")
+                if not c["ok"] and c["tip"]:
+                    lines.append(f"   💡 {c['tip']}")
+            ai = result.get("ai") or {}
+            if ai.get("improved_title"):
+                lines.append(f"\n✨ *Improved title:* {ai['improved_title']}")
+            for t in ai.get("tips", []):
+                lines.append(f"🤖 {t}")
+            await msg.edit_text("\n".join(lines)[:4090], parse_mode="Markdown")
+        except Exception as e:
+            await msg.edit_text(f"❌ SEO check failed: `{e}`", parse_mode="Markdown")
+
+    # ------------------------------------------------------------------
+    # 🛡️ /safety — pre-upload policy/copyright audit
+    # ------------------------------------------------------------------
+    async def cmd_safety(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        import agent_features
+        raw = " ".join(context.args).strip()
+        if not raw or raw.lower() == "last":
+            last = agent_brain.get_last_production()
+            if not last:
+                await update.message.reply_text("Usage: `/safety <text to audit>` or `/safety last`", parse_mode="Markdown")
+                return
+            title = last.get("title") or ""
+            body = (last.get("narration") or last.get("description") or "")[:2500]
+        else:
+            title, body = raw[:120], raw
+        msg = await update.message.reply_text("🛡️ Auditing for policy / copyright / demonetization risks...")
+        try:
+            result = await asyncio_to_thread(agent_features.safety_check, get_engine(), title, body)
+            icon = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(str(result.get("risk_level", "low")).lower(), "⚪")
+            lines = [f"🛡️ *Safety Audit: {icon} {str(result.get('risk_level', '?')).upper()} RISK*\n"]
+            for issue in result.get("issues", [])[:6]:
+                lines.append(f"⚠️ {issue}")
+            for fix in result.get("fixes", [])[:5]:
+                lines.append(f"🔧 {fix}")
+            if result.get("keyword_flags"):
+                lines.append(f"\n🔎 Flagged keywords: {', '.join(result['keyword_flags'][:8])}")
+            lines.append("\nRun before every upload: `/safety last` then `/seo last`")
+            await msg.edit_text("\n".join(lines)[:4090], parse_mode="Markdown")
+        except Exception as e:
+            await msg.edit_text(f"❌ Safety check failed: `{e}`", parse_mode="Markdown")
+
+    # ------------------------------------------------------------------
+    # 📅 /besttime — when your viewers actually watch
+    # ------------------------------------------------------------------
+    async def cmd_besttime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        import agent_features
+        days = 90
+        if context.args and context.args[0].isdigit():
+            days = min(max(int(context.args[0]), 7), 720)
+        msg = await update.message.reply_text(f"📅 Analyzing {days} days of viewer activity...")
+        try:
+            result = await asyncio_to_thread(agent_features.best_time_to_post, get_engine(), days)
+            await msg.edit_text(result["summary"], parse_mode="Markdown")
+        except RuntimeError as e:
+            await msg.edit_text(f"🔐 {e}", parse_mode="Markdown")
+        except Exception as e:
+            await msg.edit_text(f"❌ Best-time analysis failed: `{e}`", parse_mode="Markdown")
+
+    # ------------------------------------------------------------------
+    # 📊 /digest — weekly report (on demand + auto every Sunday 18:00)
+    # ------------------------------------------------------------------
+    async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        arg = " ".join(context.args).strip().lower()
+        if arg == "off":
+            agent_brain.kv_set("digest_enabled", "0")
+            await update.message.reply_text("🔕 Weekly digest OFF. `/digest on` to re-enable.")
+            return
+        if arg == "on":
+            agent_brain.kv_set("digest_enabled", "1")
+            tz = os.getenv("SCHEDULER_TZ", "Asia/Dhaka")
+            await update.message.reply_text(f"🔔 Weekly digest ON — every Sunday 18:00 ({tz}).", parse_mode="Markdown")
+            return
+        msg = await update.message.reply_text("📊 Preparing your digest (analytics + topic ideas)...")
+        try:
+            digest = await build_weekly_digest()
+            await msg.edit_text(digest[:4090], parse_mode="Markdown")
+        except Exception as e:
+            await msg.edit_text(f"❌ Digest failed: `{e}`", parse_mode="Markdown")
+
+    # ------------------------------------------------------------------
+    # 📺 /news — breaking-news auto-produce mode
+    # ------------------------------------------------------------------
+    async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        import agent_features
+        args = [a.lower() for a in (context.args or [])]
+        if args and args[0] == "on":
+            agent_brain.kv_set("news_mode", "1")
+            agent_brain.kv_set("news_auto_upload", "1" if "upload" in args else "0")
+            kws = agent_brain.get_profile().get("alert_keywords") or agent_brain.get_profile().get("niche") or ""
+            await update.message.reply_text(
+                "📺 *Breaking-News Mode ON!* 🚨\n\n"
+                f"Every 2h I scan Google News for: *{kws or '(set keywords: /alerts ai, space)'}*\n"
+                "Fresh news hole automatic 1080p video baniye dibo" +
+                (" + auto-upload! 🚀" if "upload" in args else " (chat e deliver korbo)."),
+                parse_mode="Markdown",
+            )
+            return
+        if args and args[0] == "off":
+            agent_brain.kv_set("news_mode", "0")
+            await update.message.reply_text("📺 Breaking-News Mode OFF.")
+            return
+        # manual peek
+        msg = await update.message.reply_text("📰 Scanning fresh news for your niche...")
+        try:
+            kws = [k.strip() for k in (agent_brain.get_profile().get("alert_keywords") or "").split(",") if k.strip()]
+            niche = agent_brain.get_profile().get("niche", "")
+            if niche:
+                kws.append(niche)
+            if not kws:
+                await msg.edit_text("Set keywords first: `/alerts ai, space` then `/news check`.", parse_mode="Markdown")
+                return
+            seen = [s for s in agent_brain.kv_get("news_seen", "").split("|||") if s][-100:]
+            fresh = await asyncio_to_thread(agent_features.check_breaking_news, kws, seen, 24.0)
+            if not fresh:
+                await msg.edit_text("📭 Nothing breaking in the last 24h. Auto mode: `/news on upload`", parse_mode="Markdown")
+                return
+            lines = ["🚨 *Fresh in your niche:*\n"] + [f"• {f['title']}" for f in fresh[:6]]
+            lines.append(f"\nProduce now: `/produce {fresh[0]['title'][:60]}`")
+            lines.append("Auto mode: `/news on upload`")
+            await msg.edit_text("\n".join(lines)[:4090], parse_mode="Markdown")
+        except Exception as e:
+            await msg.edit_text(f"❌ News check failed: `{e}`", parse_mode="Markdown")
 
     async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         popped = PENDING_AUTH.pop(update.effective_chat.id, None)
@@ -1336,6 +1657,12 @@ def build_application():
     app.add_handler(CommandHandler(["reauth"], cmd_reauth))
     app.add_handler(CallbackQueryHandler(on_suggestion_tap, pattern="^(p|s)\\d+$"))
     app.add_handler(CallbackQueryHandler(on_thumb_pick, pattern="^ab:"))
+    app.add_handler(CommandHandler(["seo"], cmd_seo))
+    app.add_handler(CommandHandler(["safety"], cmd_safety))
+    app.add_handler(CommandHandler(["besttime"], cmd_besttime))
+    app.add_handler(CommandHandler(["digest"], cmd_digest))
+    app.add_handler(CommandHandler(["news"], cmd_news))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice_note))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_chat))
     return app
 

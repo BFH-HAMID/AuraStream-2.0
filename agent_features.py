@@ -462,3 +462,227 @@ def _parse_time(text: str) -> Optional[Tuple[int, int]]:
             h += 12
         return h, mi
     return None
+
+# =============================================================================
+# 5. SEO Scorer — heuristic scoring (free, instant) + optional AI rewrite tips
+# =============================================================================
+POWER_WORDS = ("secret", "proven", "ultimate", "insane", "shocking", "truth",
+               "finally", "exposed", "mistakes", "nobody", "best", "why", "how",
+               "hidden", "banned", "crazy")
+
+
+def seo_score(engine, title: str, description: str, tags) -> Dict:
+    """Score YouTube metadata 0-100 with actionable checks + AI improved title/tips."""
+    from agent_brain import _extract_json
+
+    title = (title or "").strip()
+    description = (description or "").strip()
+    if isinstance(tags, str):
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+    else:
+        tag_list = [str(t) for t in (tags or [])]
+
+    checks = []
+
+    def add(name, ok, points, tip):
+        checks.append({"check": name, "ok": bool(ok), "points": points if ok else 0,
+                       "max": points, "tip": tip})
+
+    # --- Title (35 pts) ---
+    tlen = len(title)
+    add("Title length 40-70 chars", 40 <= tlen <= 70, 12,
+        f"Title is {tlen} chars — 40-70 displays fully on mobile search")
+    add("Number or brackets in title", bool(re.search(r"\d", title)) or ("[" in title or "(" in title), 8,
+        "Numbers/brackets boost CTR: '7 Ways...' or '[2026]'")
+    add("Power word in title", any(w in title.lower() for w in POWER_WORDS), 8,
+        "Add a curiosity word: secret, nobody, finally, exposed...")
+    title_alpha = sum(1 for c in title if c.isalpha()) or 1
+    add("No shouty ALL-CAPS", sum(1 for c in title if c.isupper()) / title_alpha < 0.4, 7,
+        "Excessive caps looks spammy")
+
+    # --- Description (35 pts) ---
+    dlen = len(description)
+    add("Description 300+ chars", dlen >= 300, 12, f"Description is {dlen} chars — aim for 300+")
+    add("First 125 chars front-load keywords", len(description[:125].split()) >= 15, 8,
+        "First 125 chars show in search results — put main keywords there")
+    add("Chapter timestamps (0:00)", bool(re.search(r"\b\d{1,2}:\d{2}\b", description)), 8,
+        "Add '0:00 Intro' style timestamps — enables Chapters + boosts watch time")
+    add("Hashtags present", "#" in description, 7, "Add 2-3 #hashtags at the end")
+
+    # --- Tags (20 pts) ---
+    add("10-20 tags", 10 <= len(tag_list) <= 20, 10,
+        f"You have {len(tag_list)} tags — 10-20 is the sweet spot")
+    add("Mix of short + long-tail tags",
+        any(len(t.split()) >= 2 for t in tag_list) and any(len(t.split()) == 1 for t in tag_list), 10,
+        "Mix single-word and multi-word (long-tail) tags")
+
+    # --- Consistency (10 pts) ---
+    if tag_list:
+        kw = tag_list[0].lower()
+        add("Main tag in title AND description", kw in title.lower() and kw in description.lower(), 10,
+            f"Your main tag '{tag_list[0]}' should appear in both title and description")
+    else:
+        add("Has tags at all", False, 10, "Add tags!")
+
+    score = sum(c["points"] for c in checks)
+    grade = "A" if score >= 80 else "B" if score >= 65 else "C" if score >= 50 else "D"
+
+    # --- AI improvement suggestions (best effort) ---
+    ai = {}
+    try:
+        prompt = (
+            "You are a YouTube SEO expert. Improve this metadata.\n"
+            f"Title: {title}\nDescription: {description[:500]}\nTags: {', '.join(tag_list)}\n\n"
+            'Reply ONLY with JSON: {"improved_title": "...", "improved_tags": ["tag1", "tag2"], '
+            '"tips": ["tip1", "tip2", "tip3"]}'
+        )
+        data = None
+        try:
+            resp = engine.get_gemini_client().models.generate_content(model="gemini-2.5-flash", contents=prompt)
+            data = _extract_json(resp.text)
+        except Exception:
+            pass
+        if not isinstance(data, dict):
+            try:
+                from hf_engine import get_hf_engine
+                data = _extract_json(get_hf_engine().generate_text(prompt, max_new_tokens=400))
+            except Exception:
+                data = None
+        if isinstance(data, dict):
+            ai = {
+                "improved_title": str(data.get("improved_title", ""))[:120],
+                "improved_tags": [str(t) for t in (data.get("improved_tags") or [])][:15],
+                "tips": [str(t) for t in (data.get("tips") or [])][:3],
+            }
+    except Exception as e:
+        logger.warning(f"SEO AI suggestions unavailable: {e}")
+
+    return {"score": score, "grade": grade, "checks": checks, "ai": ai}
+
+
+# =============================================================================
+# 6. Pre-upload Safety Check — policy/copyright/demonetization audit
+# =============================================================================
+RISK_KEYWORDS = ("kill", "murder", "drug", "weapon", "gun", "nude", "porn", "sex",
+                 "gambling", "casino", "hate", "terror", "bomb", "scam", "free money",
+                 "get rich quick", "copyright", "cracked", "pirated")
+
+
+def safety_check(engine, title: str, text: str) -> Dict:
+    """Audit a video (title + script/description) for upload risks BEFORE publishing."""
+    from agent_brain import _extract_json
+
+    combined = f"{title}\n{text or ''}"[:3000].lower()
+    flagged = [w for w in RISK_KEYWORDS if w in combined]
+
+    prompt = (
+        "Audit this YouTube video BEFORE upload for: policy violations, copyright risks "
+        "(music/footage/brands), demonetization/advertiser-unfriendly content, misinformation.\n"
+        f"Title: {title}\nContent: {(text or '')[:1200]}\n\n"
+        'Reply ONLY with JSON: {"risk_level": "low|medium|high", "issues": ["..."], '
+        '"fixes": ["actionable fix", ...]}'
+    )
+    data = None
+    try:
+        resp = engine.get_gemini_client().models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        data = _extract_json(resp.text)
+    except Exception as e:
+        logger.warning(f"Gemini safety audit failed: {e}")
+    if not isinstance(data, dict):
+        try:
+            from hf_engine import get_hf_engine
+            data = _extract_json(get_hf_engine().generate_text(prompt, max_new_tokens=400))
+        except Exception:
+            data = None
+
+    if isinstance(data, dict) and data.get("risk_level") in ("low", "medium", "high"):
+        data["keyword_flags"] = flagged
+        return data
+
+    # Offline heuristic fallback
+    level = "high" if len(flagged) >= 2 else "medium" if flagged else "low"
+    return {
+        "risk_level": level,
+        "issues": [f"Flagged keyword: '{w}'" for w in flagged] or ["No obvious risk keywords found (offline check only)"],
+        "fixes": [] if not flagged else ["Remove/replace flagged terms, or reword the script"],
+        "keyword_flags": flagged,
+    }
+
+
+# =============================================================================
+# 7. Best Time to Post — YouTube Analytics per-hour views (free)
+# =============================================================================
+def best_time_to_post(engine, days: int = 90) -> Dict:
+    """Find when the channel's viewers actually watch — per-hour view histogram."""
+    from googleapiclient.discovery import build
+
+    creds = engine.get_cached_youtube_credentials()
+    if creds is None:
+        raise RuntimeError("YouTube sign-in needed — use /reauth first")
+
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days)
+    yta = build("youtubeAnalytics", "v2", credentials=creds)
+    resp = yta.reports().query(
+        ids="channel==MINE", startDate=start.isoformat(), endDate=end.isoformat(),
+        metrics="views", dimensions="hour", sort="hour",
+    ).execute()
+
+    buckets = {}
+    for row in resp.get("rows", []):
+        try:
+            raw = str(row[0])
+            # hour values can be 'HH' or full timestamps like '2026-09-23T14:00:00Z' / '2026092314'
+            if "T" in raw:
+                hour = int(raw.split("T")[1][:2])
+            elif len(raw) > 2 and raw.isdigit():
+                hour = int(raw[-2:])
+            else:
+                hour = int(raw)
+            buckets[hour] = buckets.get(hour, 0) + int(row[1])
+        except Exception:
+            continue
+
+    if not buckets:
+        return {"summary": f"📭 Not enough analytics data for the last {days} days yet. Try again after more views.", "best_hour": None, "buckets": {}}
+
+    peak = max(buckets.values())
+    best_hour = max(buckets, key=buckets.get)
+    lines = [f"📅 *Best time to post* (viewer activity, last {days} days)", ""]
+    for h, v in sorted(buckets.items(), key=lambda x: -x[1])[:6]:
+        bar = "▇" * max(1, int(v / peak * 12))
+        lines.append(f"`{h:02d}:00` {bar} {v:,}")
+    lines.append(f"\n🏆 Your audience peaks at *{best_hour:02d}:00 UTC*")
+    lines.append(f"Suggested: `/schedule daily {best_hour:02d}:00 upload`")
+    return {"summary": "\n".join(lines), "best_hour": best_hour, "buckets": buckets}
+
+
+# =============================================================================
+# 10. Breaking-News detector — keyless Google News RSS (free)
+# =============================================================================
+def check_breaking_news(keywords: List[str], seen_titles: List[str], hours: float = 12.0,
+                        per_keyword: int = 5) -> List[Dict]:
+    """Fresh news (last `hours`) for the given keywords, excluding already-seen titles."""
+    from email.utils import parsedate_to_datetime
+
+    fresh = []
+    seen = set(seen_titles or [])
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    for kw in [k.strip() for k in keywords if k and k.strip()][:3]:
+        for item in _fetch_news_headlines(kw, limit=per_keyword):
+            title = item["title"]
+            if title in seen:
+                continue
+            pub_dt = None
+            try:
+                pub_dt = parsedate_to_datetime(item.get("date", ""))
+                if pub_dt is not None and pub_dt.tzinfo is None:
+                    pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                pub_dt = None
+            if pub_dt is not None and pub_dt < cutoff:
+                continue
+            fresh.append({"keyword": kw, "title": title, "date": item.get("date", ""),
+                          "fresh": pub_dt is not None})
+    return fresh[:5]

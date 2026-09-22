@@ -333,6 +333,40 @@ def download_bulk_videos(keywords: list, quality: str = "1080p") -> list:
     return downloaded_paths
 
 # ==============================================================================
+# 3b. SRT Caption Writer (for YouTube CC upload)
+# ==============================================================================
+def _format_srt_timestamp(seconds: float) -> str:
+    """Seconds -> 'HH:MM:SS,mmm' (SRT format)."""
+    seconds = max(0.0, float(seconds))
+    ms = int(round((seconds - int(seconds)) * 1000))
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    if ms >= 1000:
+        s += 1
+        ms = 0
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def write_srt_from_segments(segments: list, srt_path: str) -> bool:
+    """Write whisper segments as a valid .srt caption file. Returns True on success."""
+    blocks = []
+    for seg in segments or []:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(seg.get("start", 0))
+        end = float(seg.get("end", start + 1.0))
+        if end <= start:
+            end = start + 0.8
+        blocks.append(f"{len(blocks) + 1}\n{_format_srt_timestamp(start)} --> {_format_srt_timestamp(end)}\n{text}\n")
+    if not blocks:
+        return False
+    with open(srt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(blocks))
+    return True
+
+
+# ==============================================================================
 # 4. MoviePy Video & Subtitle Assembler - 1080p FULL HD Prompt
 # ==============================================================================
 def _fit_clip_to_resolution(clip, target_resolution):
@@ -418,6 +452,14 @@ def create_mega_production(clips_paths: list, audio_path: str, title: str, outpu
         try:
             model = whisper.load_model("base")
             results = whisper.transcribe(model, temp_wav)
+
+            # Save word-timed .srt next to the final video (for YouTube CC upload)
+            try:
+                srt_path = os.path.splitext(output_path)[0] + ".srt"
+                if write_srt_from_segments(results.get("segments", []), srt_path):
+                    logger.info(f"SRT captions saved to {srt_path}")
+            except Exception as e:
+                logger.warning(f"SRT write failed: {e}")
 
             colors = ['yellow', 'cyan', 'white', 'green']
             font_path = get_font_path(75)
@@ -879,6 +921,29 @@ def upload_video_to_youtube(video_path: str, thumb_path: str, meta_data: dict) -
         logger.warning(f"Pinned comment failed: {e}")
 
     return video_id
+
+def upload_captions_to_youtube(video_id: str, srt_path: str, language: str = "en") -> bool:
+    """Upload an .srt caption track to a YouTube video (Captions API - free, ~50 quota units).
+    Boosts SEO, accessibility and search discoverability."""
+    creds = get_cached_youtube_credentials()
+    if creds is None:
+        logger.warning("Captions upload skipped: no cached YouTube credentials")
+        return False
+    if not os.path.exists(srt_path):
+        logger.warning(f"Captions file missing: {srt_path}")
+        return False
+    try:
+        youtube = build("youtube", "v3", credentials=creds)
+        youtube.captions().insert(
+            part="snippet",
+            body={"snippet": {"videoId": video_id, "language": language, "name": "AuraStream AI"}},
+            media_body=MediaFileUpload(srt_path, mimetype="application/octet-stream")
+        ).execute()
+        logger.info(f"Captions uploaded for {video_id} ({language})")
+        return True
+    except Exception as e:
+        logger.warning(f"Captions upload failed: {e}")
+        return False
 
 # ==============================================================================
 # 8. Telegram Bot Alert System Prompt

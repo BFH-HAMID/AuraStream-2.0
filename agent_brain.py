@@ -54,6 +54,11 @@ _INTENTS = [
     "alerts",       # trend spike alert settings
     "boost",        # engagement boost (top comment reply)
     "voices",       # list/select TTS voices
+    "seo",          # SEO scoring of title/description/tags
+    "safety",       # pre-upload policy/copyright audit
+    "besttime",     # best time to post analysis
+    "digest",       # weekly digest
+    "news",         # breaking-news mode
     "chat",         # plain conversation
 ]
 
@@ -428,6 +433,11 @@ _FAST_PATHS = [
     (re.compile(r"^\s*(trend )?alerts?\b", re.I), "alerts"),
     (re.compile(r"^\s*(boost|engagement boost|pin)\b|\btop comment\b", re.I), "boost"),
     (re.compile(r"^\s*voices?\b", re.I), "voices"),
+    (re.compile(r"^\s*seo\b|\bscore my (seo|title|metadata)\b|\bseo (score|check)\b", re.I), "seo"),
+    (re.compile(r"\bsafety (check|audit)\b|^\s*safety\b|^\s*policy check\b|\bis (this|my) (video|script) safe\b", re.I), "safety"),
+    (re.compile(r"\bbest time to post\b|^\s*besttime\b|\bwhen should i (post|upload)\b", re.I), "besttime"),
+    (re.compile(r"^\s*digest\b|\bweekly (digest|report)\b", re.I), "digest"),
+    (re.compile(r"^\s*(breaking ?news|news mode)\b|^\s*news\b", re.I), "news"),
     (re.compile(r"^\s*(history|my videos|past videos)\b|\bvideo history\b.*\b(dekhao|show|dik)\b|\bshow\b.*\bhistory\b", re.I), "history"),
     (re.compile(r"^\s*remember\s+\S+", re.I), "remember"),
     (re.compile(r"^\s*(settings|setting)\b", re.I), "settings"),
