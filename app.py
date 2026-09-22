@@ -149,14 +149,21 @@ def get_font_path(size: int = 90):
 # ==============================================================================
 # 1. Gemini Script & Metadata Prompt
 # ==============================================================================
-def generate_long_script(topic: str, duration_mins: int) -> dict:
+def generate_long_script(topic: str, duration_mins: int, research_facts: str = "") -> dict:
     """Generate documentary script and metadata using Gemini."""
     client = get_gemini_client()
     target_words = duration_mins * 150
 
+    research_block = ""
+    if research_facts:
+        research_block = (
+            "\n    VERIFIED RESEARCH FACTS (weave these naturally into the script, stay accurate):\n"
+            f"    {research_facts[:2000]}\n"
+        )
+
     prompt = f"""
     Write a full documentary script about "{topic}".
-    Target word count should be around {target_words} words.
+    Target word count should be around {target_words} words.{research_block}
     Enforce strict JSON output with these exact keys:
     - title: Catchy YouTube title under 100 characters.
     - description: SEO-friendly summary with timestamps/chapters.
@@ -183,35 +190,68 @@ def generate_long_script(topic: str, duration_mins: int) -> dict:
 # ==============================================================================
 # 2. Voiceover & Audio Engine Prompt
 # ==============================================================================
-async def generate_voiceover_async(text: str, output_path: str):
-    """Async TTS using edge-tts with pause handling."""
+async def generate_voiceover_async(text: str, output_path: str, voice: str = None):
+    """Async TTS using edge-tts with pause handling. Voice via /voices use <name> or DEFAULT_TTS_VOICE."""
     # Parse by periods, join with explicit pauses for more natural speech
     sentences = [s.strip() for s in text.split('.') if s.strip()]
     if not sentences:
         raise ValueError("No sentences to synthesize")
 
     processed_text = "... ".join(sentences) + "."
-    communicate = edge_tts.Communicate(processed_text, "en-US-ChristopherNeural")
+    voice = voice or os.getenv("DEFAULT_TTS_VOICE", "").strip() or "en-US-ChristopherNeural"
+    communicate = edge_tts.Communicate(processed_text, voice)
     await communicate.save(output_path)
     logger.info(f"Voiceover saved to {output_path}")
 
-def generate_voiceover_sync(text: str, output_path: str):
+def generate_voiceover_sync(text: str, output_path: str, voice: str = None):
     """Sync wrapper for Streamlit and non-async contexts."""
     try:
         # If there's already a running loop (unlikely in Streamlit), create new
-        asyncio.run(generate_voiceover_async(text, output_path))
+        asyncio.run(generate_voiceover_async(text, output_path, voice))
     except RuntimeError:
         # Fallback for environments with existing loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(generate_voiceover_async(text, output_path))
+        loop.run_until_complete(generate_voiceover_async(text, output_path, voice))
         loop.close()
 
 # ==============================================================================
-# 3. Dual Fallback Video Downloader Prompt
+# 3. Dual Fallback Video Downloader - 1080p FULL HD ENGINE
 # ==============================================================================
-def download_bulk_videos(keywords: list) -> list:
-    """Download stock footage with Pexels primary and Pixabay fallback."""
+# Supported quality modes: "1080p" (Full HD, default), "720p" (HD), "best" (max available)
+def _pick_pexels_video_file(video_files: list, quality: str = "1080p"):
+    """Select the best Pexels video file for the requested quality (Full HD aware)."""
+    files = [f for f in video_files if f.get("height")]
+    if not files:
+        return None
+    target = 720 if quality == "720p" else 1080
+    # 1) Exact match (e.g. exactly 1920x1080 Full HD)
+    exact = [f for f in files if f.get("height") == target]
+    if exact:
+        return exact[0]
+    # 2) Next resolution ABOVE target (downscaling loses less quality than upscaling)
+    higher = [f for f in files if f.get("height", 0) > target]
+    if higher:
+        return sorted(higher, key=lambda f: f.get("height", 0))[0]
+    # 3) Largest available as last resort
+    return sorted(files, key=lambda f: f.get("height", 0), reverse=True)[0]
+
+
+def _pick_pixabay_video_file(videos: dict, quality: str = "1080p"):
+    """Select the best Pixabay rendition for the requested quality (Full HD aware)."""
+    if quality == "720p":
+        chain = ["medium", "large", "small"]
+    else:
+        # 1080p / best: prefer the large (typically 1920x1080 Full HD) rendition
+        chain = ["large", "medium", "small"]
+    for size in chain:
+        if videos.get(size, {}).get("url"):
+            return videos[size]["url"], videos[size]
+    return None, None
+
+
+def download_bulk_videos(keywords: list, quality: str = "1080p") -> list:
+    """Download stock footage (1080p Full HD by default) with Pexels primary and Pixabay fallback."""
     if not keywords:
         logger.warning("No keywords provided for video download")
         return []
@@ -219,6 +259,8 @@ def download_bulk_videos(keywords: list) -> list:
     if not PEXELS_API_KEY and not PIXABAY_API_KEY:
         logger.warning("Both PEXELS and PIXABAY API keys missing, cannot download videos")
         return []
+
+    logger.info(f"Downloading stock footage at quality mode: {quality.upper()}")
 
     downloaded_paths = []
 
@@ -242,15 +284,12 @@ def download_bulk_videos(keywords: list) -> list:
 
                 if data.get("videos"):
                     video_files = data["videos"][0].get("video_files", [])
-                    if video_files:
-                        # Prefer 1080p, else highest
-                        hd_file = next((f for f in video_files if f.get("height") == 1080), None)
-                        if not hd_file:
-                            # Sort by height descending
-                            hd_file = sorted(video_files, key=lambda x: x.get("height", 0), reverse=True)[0]
+                    hd_file = _pick_pexels_video_file(video_files, quality)
+                    if hd_file:
                         video_url = hd_file.get("link")
+                        resolution = f"{hd_file.get('width', '?')}x{hd_file.get('height', '?')}"
                         if video_url:
-                            vid_res = requests.get(video_url, stream=True, timeout=20)
+                            vid_res = requests.get(video_url, stream=True, timeout=30)
                             vid_res.raise_for_status()
                             with open(output_path, 'wb') as f:
                                 for chunk in vid_res.iter_content(chunk_size=8192):
@@ -259,7 +298,7 @@ def download_bulk_videos(keywords: list) -> list:
                             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                                 downloaded_paths.append(output_path)
                                 success = True
-                                logger.info(f"Pexels success for '{keyword}' -> {output_path}")
+                                logger.info(f"Pexels success for '{keyword}' [{resolution}] -> {output_path}")
             except Exception as e:
                 logger.warning(f"Pexels failed for '{keyword}': {e}")
 
@@ -272,13 +311,11 @@ def download_bulk_videos(keywords: list) -> list:
                 data = res.json()
 
                 if data.get("hits"):
-                    # Try first hit with large video
                     for hit in data["hits"]:
                         videos = hit.get("videos", {})
-                        large = videos.get("large", {}) or videos.get("medium", {}) or videos.get("small", {})
-                        video_url = large.get("url")
+                        video_url, rendition = _pick_pixabay_video_file(videos, quality)
                         if video_url:
-                            vid_res = requests.get(video_url, stream=True, timeout=20)
+                            vid_res = requests.get(video_url, stream=True, timeout=30)
                             vid_res.raise_for_status()
                             with open(output_path, 'wb') as f:
                                 for chunk in vid_res.iter_content(chunk_size=8192):
@@ -287,7 +324,8 @@ def download_bulk_videos(keywords: list) -> list:
                             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                                 downloaded_paths.append(output_path)
                                 success = True
-                                logger.info(f"Pixabay success for '{keyword}' -> {output_path}")
+                                if rendition:
+                                    logger.info(f"Pixabay success for '{keyword}' [{rendition.get('width', '?')}x{rendition.get('height', '?')}] -> {output_path}")
                                 break
             except Exception as e:
                 logger.warning(f"Pixabay fallback failed for '{keyword}': {e}")
@@ -295,14 +333,70 @@ def download_bulk_videos(keywords: list) -> list:
     return downloaded_paths
 
 # ==============================================================================
-# 4. MoviePy Video & Subtitle Assembler Prompt
+# 3b. SRT Caption Writer (for YouTube CC upload)
 # ==============================================================================
-def create_mega_production(clips_paths: list, audio_path: str, title: str, output_path: str):
-    """Assemble final video with voiceover and word-level subtitles (MoviePy 2.x compatible)."""
+def _format_srt_timestamp(seconds: float) -> str:
+    """Seconds -> 'HH:MM:SS,mmm' (SRT format)."""
+    seconds = max(0.0, float(seconds))
+    ms = int(round((seconds - int(seconds)) * 1000))
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    if ms >= 1000:
+        s += 1
+        ms = 0
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def write_srt_from_segments(segments: list, srt_path: str) -> bool:
+    """Write whisper segments as a valid .srt caption file. Returns True on success."""
+    blocks = []
+    for seg in segments or []:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(seg.get("start", 0))
+        end = float(seg.get("end", start + 1.0))
+        if end <= start:
+            end = start + 0.8
+        blocks.append(f"{len(blocks) + 1}\n{_format_srt_timestamp(start)} --> {_format_srt_timestamp(end)}\n{text}\n")
+    if not blocks:
+        return False
+    with open(srt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(blocks))
+    return True
+
+
+# ==============================================================================
+# 4. MoviePy Video & Subtitle Assembler - 1080p FULL HD Prompt
+# ==============================================================================
+def _fit_clip_to_resolution(clip, target_resolution):
+    """Scale + center-crop a clip to exactly fill target_resolution (w, h). MoviePy 1.x & 2.x compatible."""
+    tw, th = target_resolution
+    try:
+        scale = max(tw / max(clip.w, 1), th / max(clip.h, 1))
+        if MOVIEPY_V2:
+            clip = clip.resized(scale)
+        else:
+            clip = clip.resize(newsize=(max(1, int(clip.w * scale)), max(1, int(clip.h * scale))))
+        x1 = max(0, (clip.w - tw) // 2)
+        y1 = max(0, (clip.h - th) // 2)
+        if MOVIEPY_V2:
+            clip = clip.cropped(x1=x1, y1=y1, width=min(tw, clip.w), height=min(th, clip.h))
+        else:
+            clip = clip.crop(x1=x1, y1=y1, width=min(tw, clip.w), height=min(th, clip.h))
+    except Exception as e:
+        logger.warning(f"Could not fit clip to {target_resolution}: {e}")
+    return clip
+
+
+def create_mega_production(clips_paths: list, audio_path: str, title: str, output_path: str, target_resolution=(1920, 1080)):
+    """Assemble final 1080p Full HD video with voiceover and word-level subtitles (MoviePy 2.x compatible)."""
     if not clips_paths:
         raise ValueError("No video clips provided")
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+    logger.info(f"Assembling production at target resolution: {target_resolution[0]}x{target_resolution[1]}")
 
     audio = AudioFileClip(audio_path)
     audio_duration = audio.duration
@@ -319,6 +413,12 @@ def create_mega_production(clips_paths: list, audio_path: str, title: str, outpu
                 clip = clip.without_audio()
             else:
                 clip = clip.without_audio()
+            # Normalize every clip to the target resolution (1080p Full HD) and 30fps
+            clip = _fit_clip_to_resolution(clip, target_resolution)
+            if MOVIEPY_V2:
+                clip = clip.with_fps(30)
+            else:
+                clip = clip.set_fps(30)
             clips.append(clip)
             current_duration += clip.duration
             if current_duration >= audio_duration:
@@ -352,6 +452,14 @@ def create_mega_production(clips_paths: list, audio_path: str, title: str, outpu
         try:
             model = whisper.load_model("base")
             results = whisper.transcribe(model, temp_wav)
+
+            # Save word-timed .srt next to the final video (for YouTube CC upload)
+            try:
+                srt_path = os.path.splitext(output_path)[0] + ".srt"
+                if write_srt_from_segments(results.get("segments", []), srt_path):
+                    logger.info(f"SRT captions saved to {srt_path}")
+            except Exception as e:
+                logger.warning(f"SRT write failed: {e}")
 
             colors = ['yellow', 'cyan', 'white', 'green']
             font_path = get_font_path(75)
@@ -405,13 +513,15 @@ def create_mega_production(clips_paths: list, audio_path: str, title: str, outpu
     else:
         mega_production = final_video
 
-    # Write final video
+    # Write final video - adaptive bitrate for crisp Full HD output
+    render_bitrate = "5000k" if target_resolution[1] <= 720 else "8000k"
     try:
         mega_production.write_videofile(
             output_path,
             codec="libx264",
             fps=30,
             audio_codec="aac",
+            bitrate=render_bitrate,
             logger=None
         )
     finally:
@@ -623,20 +733,131 @@ def generate_thumbnail_with_text(prompt: str, title_text: str, output_path: str)
 # ==============================================================================
 # 7. YouTube Upload & Comment Automation Prompt
 # ==============================================================================
+YOUTUBE_TOKEN_FILE = os.getenv("YOUTUBE_TOKEN_FILE", "token.pickle")
+
+# Headless-friendly client config (works on HF Spaces / servers without a browser).
+# Supports client_secrets.json OR GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET env vars.
+_GOOGLE_AUTH_CONFIG = {
+    "installed": {
+        "client_id": os.getenv("GOOGLE_CLIENT_ID", ""),
+        "client_secret": os.getenv("GOOGLE_CLIENT_SECRET", ""),
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "redirect_uris": ["http://localhost"],
+    }
+}
+
+_HEADLESS_FLOW = None
+
+
+def _load_auth_flow():
+    """Build an InstalledAppFlow from client_secrets.json or env vars."""
+    if os.path.exists("client_secrets.json"):
+        return InstalledAppFlow.from_client_secrets_file("client_secrets.json", YOUTUBE_SCOPES)
+    if _GOOGLE_AUTH_CONFIG["installed"]["client_id"] and _GOOGLE_AUTH_CONFIG["installed"]["client_secret"]:
+        return InstalledAppFlow.from_client_config(_GOOGLE_AUTH_CONFIG, scopes=YOUTUBE_SCOPES)
+    raise FileNotFoundError(
+        "Google OAuth setup missing. Provide client_secrets.json OR set "
+        "GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET environment variables."
+    )
+
+
+def get_cached_youtube_credentials():
+    """Load saved YouTube credentials (token.pickle), refreshing if expired."""
+    import pickle
+    from google.oauth2.credentials import Credentials as _UnusedCreds  # noqa: F401 (ensures google-auth present)
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+
+    if not os.path.exists(YOUTUBE_TOKEN_FILE):
+        return None
+    try:
+        with open(YOUTUBE_TOKEN_FILE, "rb") as f:
+            creds = pickle.load(f)
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(GoogleAuthRequest())
+                with open(YOUTUBE_TOKEN_FILE, "wb") as f:
+                    pickle.dump(creds, f)
+            except Exception as e:
+                logger.warning(f"Credential refresh failed (re-auth needed): {e}")
+                return None
+        return creds if creds and creds.valid else None
+    except Exception as e:
+        logger.warning(f"Could not load cached YouTube credentials: {e}")
+        return None
+
+
+def build_headless_auth_url() -> str:
+    """Create an OAuth URL the user can open on ANY device (phone/laptop).
+    Google will redirect to a dead localhost URL — the user copies that URL back."""
+    global _HEADLESS_FLOW
+    flow = _load_auth_flow()
+    flow.redirect_uri = "http://localhost:1"  # dead port; the code still lands in the URL bar
+    auth_url, _ = flow.authorization_url(
+        access_type="offline", include_granted_scopes="true", prompt="consent"
+    )
+    _HEADLESS_FLOW = flow  # stash flow for the code exchange step
+    return auth_url
+
+
+def exchange_auth_code(code_or_url: str):
+    """Exchange the pasted authorization code (or full redirect URL) for credentials."""
+    import pickle as _pickle
+
+    global _HEADLESS_FLOW
+    flow = _HEADLESS_FLOW or _load_auth_flow()
+    if flow.redirect_uri != "http://localhost:1":
+        flow.redirect_uri = "http://localhost:1"
+
+    code = code_or_url.strip()
+    if "code=" in code:
+        parsed = urllib.parse.parse_qs(urllib.parse.urlparse(code).query)
+        if parsed.get("code"):
+            code = parsed["code"][0]
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+    with open(YOUTUBE_TOKEN_FILE, "wb") as f:
+        _pickle.dump(creds, f)
+    _HEADLESS_FLOW = None
+    logger.info("YouTube OAuth token saved (headless auth success)")
+    return creds
+
+
+def get_youtube_service_or_url():
+    """Return (youtube_service, None) if auth is ready, else (None, auth_url).
+    The auth_url path lets the Telegram agent guide headless sign-in."""
+    creds = get_cached_youtube_credentials()
+    if creds:
+        return build("youtube", "v3", credentials=creds), None
+    return None, build_headless_auth_url()
+
 YOUTUBE_SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
-    "https://www.googleapis.com/auth/youtube.force-ssl"
+    "https://www.googleapis.com/auth/youtube.force-ssl",
+    "https://www.googleapis.com/auth/yt-analytics.readonly"
 ]
 
 def upload_video_to_youtube(video_path: str, thumb_path: str, meta_data: dict) -> str:
-    """Upload video to YouTube with thumbnail and pinned comment."""
+    """Upload video to YouTube with thumbnail and pinned comment.
+    Uses saved headless token (token.pickle) if available, else local browser flow."""
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video file not found: {video_path}")
-    if not os.path.exists("client_secrets.json"):
-        raise FileNotFoundError("client_secrets.json not found. Download from Google Cloud Console.")
 
-    flow = InstalledAppFlow.from_client_secrets_file('client_secrets.json', YOUTUBE_SCOPES)
-    credentials = flow.run_local_server(port=0)
+    credentials = get_cached_youtube_credentials()
+    if credentials is not None:
+        logger.info("Using cached YouTube credentials (token.pickle)")
+    else:
+        if not os.path.exists("client_secrets.json"):
+            raise FileNotFoundError("client_secrets.json not found. Download from Google Cloud Console.")
+        flow = InstalledAppFlow.from_client_secrets_file('client_secrets.json', YOUTUBE_SCOPES)
+        credentials = flow.run_local_server(port=0)
+        # Save for headless reuse (Telegram agent / server restarts)
+        try:
+            import pickle
+            with open(YOUTUBE_TOKEN_FILE, "wb") as f:
+                pickle.dump(credentials, f)
+        except Exception as e:
+            logger.warning(f"Could not cache credentials: {e}")
     youtube = build('youtube', 'v3', credentials=credentials)
 
     # Clean tags
@@ -700,6 +921,29 @@ def upload_video_to_youtube(video_path: str, thumb_path: str, meta_data: dict) -
         logger.warning(f"Pinned comment failed: {e}")
 
     return video_id
+
+def upload_captions_to_youtube(video_id: str, srt_path: str, language: str = "en") -> bool:
+    """Upload an .srt caption track to a YouTube video (Captions API - free, ~50 quota units).
+    Boosts SEO, accessibility and search discoverability."""
+    creds = get_cached_youtube_credentials()
+    if creds is None:
+        logger.warning("Captions upload skipped: no cached YouTube credentials")
+        return False
+    if not os.path.exists(srt_path):
+        logger.warning(f"Captions file missing: {srt_path}")
+        return False
+    try:
+        youtube = build("youtube", "v3", credentials=creds)
+        youtube.captions().insert(
+            part="snippet",
+            body={"snippet": {"videoId": video_id, "language": language, "name": "AuraStream AI"}},
+            media_body=MediaFileUpload(srt_path, mimetype="application/octet-stream")
+        ).execute()
+        logger.info(f"Captions uploaded for {video_id} ({language})")
+        return True
+    except Exception as e:
+        logger.warning(f"Captions upload failed: {e}")
+        return False
 
 # ==============================================================================
 # 8. Telegram Bot Alert System Prompt
@@ -789,7 +1033,7 @@ def translate_script(text: str, target_lang: str) -> str:
 # ==============================================================================
 # 9b. Hugging Face Advanced Features - NEW ADVANCED LEVEL
 # ==============================================================================
-def generate_long_script_hf_fallback(topic: str, duration_mins: int, provider: str = "auto") -> dict:
+def generate_long_script_hf_fallback(topic: str, duration_mins: int, provider: str = "auto", research_facts: str = "") -> dict:
     """
     Advanced script generation with HF fallback
     provider: auto, gemini, huggingface, hybrid
@@ -808,11 +1052,11 @@ def generate_long_script_hf_fallback(topic: str, duration_mins: int, provider: s
         return {}
 
     if provider == "gemini":
-        return generate_long_script(topic, duration_mins)
+        return generate_long_script(topic, duration_mins, research_facts=research_facts)
 
     # Auto / Hybrid: Try Gemini first, fallback to HF
     try:
-        result = generate_long_script(topic, duration_mins)
+        result = generate_long_script(topic, duration_mins, research_facts=research_facts)
         if result and result.get("title"):
             return result
     except Exception as e:
@@ -1011,7 +1255,9 @@ def run_streamlit_dashboard():
         st.write(f"HuggingFace: {'✅' if HUGGINGFACE_API_KEY and HUGGINGFACE_API_KEY != 'your_huggingface_api_key_here' else '❌ Missing'}")
         st.write(f"Pexels: {'✅' if PEXELS_API_KEY and PEXELS_API_KEY != 'your_pexels_api_key_here' else '❌ Missing'}")
         st.write(f"Pixabay: {'✅' if PIXABAY_API_KEY and PIXABAY_API_KEY != 'your_pixabay_api_key_here' else '❌ Missing'}")
-        st.write(f"Telegram: {'✅' if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != 'your_telegram_bot_token_here' else '⚠️ Optional'}")
+        st.write(f"Telegram Alerts: {'✅' if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != 'your_telegram_bot_token_here' else '⚠️ Optional'}")
+        st.write(f"Telegram AI Agent: {'✅ Ready' if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != 'your_telegram_bot_token_here' else '❌ No bot token'}")
+        st.caption("Run agent: `python telegram_agent.py`")
         st.divider()
         
         # HF Advanced Settings
@@ -1067,13 +1313,22 @@ def run_streamlit_dashboard():
     else:
         final_topic = st.text_input("Video Topic", placeholder="Enter your topic...", key="manual_topic")
 
-    col_a, col_b, col_c = st.columns(3)
+    col_a, col_b, col_c, col_d = st.columns(4)
     with col_a:
         duration = st.slider("Video Duration (mins)", min_value=1, max_value=10, value=3)
     with col_b:
         language = st.selectbox("Language", ["English", "Bengali", "Hindi", "Spanish", "French", "German", "Arabic", "Japanese"])
     with col_c:
         quality = st.selectbox("Quality Mode", ["balanced", "speed", "ultra-quality"], index=0, help="Ultra-quality uses HF SDXL + MusicGen (slower but better)")
+    with col_d:
+        video_quality = st.selectbox(
+            "Video Resolution",
+            ["1080p Full HD (Recommended)", "720p HD", "Best Available"],
+            index=0,
+            help="1080p Full HD downloads + renders in 1920x1080 with adaptive bitrate"
+        )
+    resolution_map = {"1080p Full HD (Recommended)": "1080p", "720p HD": "720p", "Best Available": "best"}
+    selected_video_quality = resolution_map[video_quality]
 
     # Advanced options expander
     with st.expander("⚙️ Advanced AI Options", expanded=False):
@@ -1107,7 +1362,7 @@ def run_streamlit_dashboard():
         if hf_enabled and (not HUGGINGFACE_API_KEY or HUGGINGFACE_API_KEY == "your_huggingface_api_key_here"):
             st.warning("HF enabled but API key missing - will use public rate limits (slower)")
 
-        st.info(f"Pipeline started for topic: **{final_topic}** | Mode: {quality} | HF: {'✅' if hf_enabled else '❌'}")
+        st.info(f"Pipeline started for topic: **{final_topic}** | Mode: {quality} | Resolution: **{video_quality}** | HF: {'✅' if hf_enabled else '❌'}")
         progress_bar = st.progress(0)
         status_text = st.empty()
 
@@ -1203,7 +1458,7 @@ def run_streamlit_dashboard():
             if not keywords:
                 keywords = final_topic.split()[:10]
 
-            clips = download_bulk_videos(keywords[:15])
+            clips = download_bulk_videos(keywords[:15], quality=selected_video_quality)
             if not clips:
                 st.warning("No stock footage downloaded, check Pexels/Pixabay keys")
                 st.error("Cannot assemble video without footage.")
@@ -1211,7 +1466,8 @@ def run_streamlit_dashboard():
 
             progress_bar.progress(60)
             main_video_path = str(TEMP_DIR / "main_video.mp4")
-            create_mega_production(clips, voiceover_path, script_data.get("title", final_topic), main_video_path)
+            target_resolution = (1280, 720) if selected_video_quality == "720p" else (1920, 1080)
+            create_mega_production(clips, voiceover_path, script_data.get("title", final_topic), main_video_path, target_resolution=target_resolution)
             progress_bar.progress(70)
             if os.path.exists(main_video_path):
                 st.video(main_video_path)
@@ -1327,14 +1583,26 @@ def run_streamlit_dashboard():
 # ==============================================================================
 # 11. YouTube Comments Auto-Reply Prompt - FIXED + HF Sentiment Enhanced
 # ==============================================================================
-def reply_to_youtube_comments(video_id: str, use_hf_sentiment: bool = True):
-    """Auto-reply to YouTube comments using Gemini + HF Sentiment Analysis."""
-    if not os.path.exists("client_secrets.json"):
-        logger.error("client_secrets.json missing for comment reply")
-        return
+def reply_to_youtube_comments(video_id: str, use_hf_sentiment: bool = True, max_replies: int = 10):
+    """Auto-reply to YouTube comments using Gemini + HF Sentiment Analysis.
+    Uses saved headless token if available. Returns a stats dict: {replied, scanned, errors}."""
+    stats = {"replied": 0, "scanned": 0, "errors": 0}
 
-    flow = InstalledAppFlow.from_client_secrets_file('client_secrets.json', YOUTUBE_SCOPES)
-    credentials = flow.run_local_server(port=0)
+    credentials = get_cached_youtube_credentials()
+    if credentials is not None:
+        logger.info("Using cached YouTube credentials (token.pickle)")
+    else:
+        if not os.path.exists("client_secrets.json"):
+            logger.error("client_secrets.json missing for comment reply")
+            return stats
+        flow = InstalledAppFlow.from_client_secrets_file('client_secrets.json', YOUTUBE_SCOPES)
+        credentials = flow.run_local_server(port=0)
+        try:
+            import pickle
+            with open(YOUTUBE_TOKEN_FILE, "wb") as f:
+                pickle.dump(credentials, f)
+        except Exception as e:
+            logger.warning(f"Could not cache credentials: {e}")
     youtube = build('youtube', 'v3', credentials=credentials)
 
     try:
@@ -1368,6 +1636,10 @@ def reply_to_youtube_comments(video_id: str, use_hf_sentiment: bool = True):
             replies = item.get("replies", {}).get("comments", [])
 
             if len(replies) == 0 and text:
+                if stats["replied"] >= max_replies:
+                    logger.info(f"Reached max_replies limit ({max_replies}), stopping")
+                    break
+                stats["scanned"] += 1
                 try:
                     # Advanced: Analyze sentiment with HF before replying
                     sentiment_info = ""
@@ -1430,14 +1702,19 @@ def reply_to_youtube_comments(video_id: str, use_hf_sentiment: bool = True):
                             }
                         }
                     ).execute()
+                    stats["replied"] += 1
                     logger.info(f"Replied to {author}: {reply_text[:50]}")
                     time.sleep(1.5)
                 except Exception as e:
                     logger.warning(f"Failed to reply to comment {top_comment_id}: {e}")
+                    stats["errors"] += 1
                     time.sleep(2)
 
     except Exception as e:
         logger.error(f"API Quota/Rate Limit Error: {e}")
+        stats["errors"] += 1
+
+    return stats
 
 if __name__ == "__main__":
     # Streamlit sets __name__ == "__main__" when running via `streamlit run`

@@ -27,6 +27,17 @@ AuraStream is a complete, fully-automated YouTube AI Agent with **Hugging Face S
 18. **🧠 Hybrid AI Fallback:** If Gemini fails, automatically falls back to Mistral-7B/Zephyr-7B via HF - never fails!
 19. **✨ Enhanced Prompt Engineering:** HF LLM enhances thumbnail prompts for viral results
 20. **🔊 MMS-TTS Multilingual:** 1100+ languages TTS for truly global content
+21. **🤖 Telegram AI Agent (with persistent memory):** A full conversational AI agent on Telegram that *knows your channel* — channel profile, custom instructions, facts, full video history stored in SQLite. `/produce`, `/suggest` (trend analysis + tap-to-produce buttons), `/upload` (headless YouTube OAuth), `/comments` (sentiment-aware auto-replies), `/settings`, `/remember`, `/history`, free-text chat with intent detection → `telegram_agent.py` + `agent_brain.py`
+22. **🎞️ 1080p Full HD Engine:** Footage is auto-selected at exactly **1920×1080** (Pexels/Pixabay best-rendition picker), every clip is scale+cropped to Full HD, rendered at 30fps H.264 with adaptive 8 Mbps bitrate
+24. **⏰ Auto-Pilot Pack (ALL FREE):** `/schedule daily 18:00` auto-productions with auto-upload · `/analytics` YouTube performance reports · `/shorts` 9:16 Shorts · `/localize bn,hi` multi-language versions · `/thumbs` A/B/C thumbnail testing · `/research` facts from Wikipedia + Google News woven into scripts · `/alerts` proactive trend-spike notifications · `/boost` top-comment engagement replies · `/voices` 400+ free neural voices · `/reauth` fresh sign-in
+25. **🎙️ Voice Control:** Send a Telegram voice note ("make a video about black holes") — local Whisper transcribes and the agent routes the intent, hands-free
+26. **📝 Auto CC Captions:** Word-timed .srt generated during render and auto-uploaded to YouTube as closed captions (free SEO + accessibility boost)
+27. **🧮 SEO Scorer:** `/seo` grades title/description/tags 0-100 with actionable checks + AI improved title
+28. **🛡️ Pre-Upload Safety Audit:** `/safety` checks policy/copyright/demonetization risks before publishing
+29. **📅 Best Time to Post:** `/besttime` finds the hour your viewers actually watch (Analytics per-hour data)
+30. **📊 Weekly Digest:** Auto-report every Sunday — weekly performance + 5 fresh topic ideas (`/digest on/off`)
+31. **📺 Breaking-News Auto-Produce:** `/news on upload` scans news every 2h and auto-produces (and uploads) videos on fresh niche stories
+23. **🐳 Dockerfile Ready:** One-command deployment — `docker compose up` for the dashboard, `docker compose --profile agent up` to also run the Telegram AI Agent, or `RUN_TELEGRAM_AGENT=true` for both in one container (**HF Space ready** — see `DEPLOY_HF_SPACE.md`)
 
 ## 🤔 Why Hugging Face Makes It More Advanced?
 
@@ -57,6 +68,79 @@ AuraStream is a complete, fully-automated YouTube AI Agent with **Hugging Face S
    - Telegram (optional)
 
 4. Download your `client_secrets.json` from the Google Cloud Console (with YouTube Data API v3 enabled) and place it in the root directory.
+
+## 🐳 Docker (Recommended — Ready Out of the Box)
+
+```bash
+cp .env.example .env        # add your API keys
+
+# Streamlit dashboard only
+docker compose up web
+
+# Dashboard + Telegram AI Agent together
+docker compose --profile agent up
+
+# Rebuild after code changes
+docker compose up --build
+```
+
+The image uses **CPU-only PyTorch** (2.5 GB smaller), ships with ffmpeg + fonts, exposes a healthcheck on `http://localhost:8501/_stcore/health`, and persists renders/models in volumes (`temp_assets/`, `hf-cache`).
+
+## 🤖 Telegram AI Agent
+
+Control the whole studio from your phone — and the agent **remembers your channel**:
+
+1. Talk to **@BotFather** on Telegram → `/newbot` → copy the token
+2. Add to `.env`: `TELEGRAM_BOT_TOKEN=123456:ABC-DEF...`
+3. Run: `python telegram_agent.py` (or `docker compose --profile agent up agent`, or deploy to HF Space — see `DEPLOY_HF_SPACE.md`)
+
+| Command | What it does |
+|---|---|
+| `/suggest [region]` | 💡 **5 trending topic ideas with virality scores + reasons**, tailored to your niche & past videos — tap **🎬 Produce** or **📜 Script** buttons right in the chat |
+| `/produce <topic>` | 🎬 **Full autopilot**: script → voiceover → **1080p Full HD video** → AI thumbnail → delivered into the chat (remembered for `/upload`) |
+| `/upload [last\|id]` | ⬆️ **Uploads to YouTube** — headless OAuth: bot sends a Google sign-in link, you paste the redirect URL back, done. Token saved for reuse |
+| `/comments [video_id] [max]` | 💬 **Reads comments, analyzes sentiment + emotion, writes empathetic auto-replies**, reports a summary |
+| *(auto)* 📝 **CC captions** | Every upload also posts the auto-generated .srt as closed captions (SEO boost) |
+| `/settings` | ⚙️ Teach the agent your channel: `/settings set niche tech reviews`, `/settings set tone funny`, `/settings custom always open with a shocking fact` |
+| `/remember <fact>` | 🧠 "my audience loves short tutorials" — used in every future script/reply/suggestion |
+| `/history` | 📚 Every produced/uploaded video with links |
+| `/script <topic>` | Full script + SEO metadata (Gemini → HF Mistral fallback) |
+| `/trends [region]` | Quick trending topic peek |
+| `/thumbnail <prompt> \| <title>` | AI thumbnail (SDXL → Pollinations) |
+| `/translate <lang> <text>` | Translation via NLLB-200 → Gemini (200+ languages) |
+| `/sentiment <text>` | Comment sentiment + emotion analysis |
+| `/status` | API keys, engines, YouTube auth & memory status |
+| `/forget yes` | 🧹 Wipe agent memory |
+| `/schedule daily 18:00 [upload]` | ⏰ **Auto-pilot**: every day at that time the bot picks the top trending suggestion and produces a full 1080p video (add `upload` to publish automatically) |
+| `/analytics [days]` | 📊 YouTube Analytics report: views, watch time, subs gained + top videos — with "best performer = next topic" advice |
+| `/shorts` | 📱 Cuts a 9:16 vertical Shorts from the last produced video, delivered in chat |
+| `/localize bn,hi` | 🌐 Makes Bengali/Hindi/etc. versions of the last video (translate → neural voice → Full HD audio swap) |
+| `/thumbs <prompt> \| <title>` | 🖼️ Generates **3 thumbnail variants** (cinematic / vibrant / minimalist) — tap the winner, it becomes the upload thumbnail |
+| `/research <topic>` | 🔬 Wikipedia summary + live Google News headlines — auto-injected into every script for accuracy |
+| `/alerts <keywords>` | 🚨 Checks trends every 6h — messages you proactively when a keyword spikes 1.8x+ |
+| `/boost [video_id]` | 🎁 Finds the most-liked comment, replies personally (YouTube API cannot pin — this is the next best thing), sends stats |
+| `/voices [lang]` | 🎙️ 400+ free Edge-TTS voices (Bangla `bn-BD` included) — `/voices use <name>` sets the default |
+| `/reauth` | 🔐 Fresh YouTube sign-in (adds the analytics scope) |
+| **🎙️ Voice note** | Just hold and speak — "make a video about black holes" — Whisper (local, free) transcribes and the agent acts |
+| `/seo <title> \| <desc> \| <tags>` | 🧮 SEO score /100 with checks + AI improved title & tips (`/seo last` for the last production) |
+| `/safety last` | 🛡️ Policy/copyright/demonetization audit before upload (Gemini + offline keyword heuristic) |
+| `/besttime [days]` | 📅 Per-hour viewer activity histogram + suggested `/schedule` time |
+| `/digest [on\|off]` | 📊 Weekly digest every Sunday 18:00: analytics + 5 topic ideas + pre-upload checklist |
+| `/news on [upload]` | 📺 **Breaking-News Mode**: scans Google News every 2h, auto-produces a 1080p video on fresh stories (add `upload` to auto-publish) |
+| Just type anything | 💬 Free-text chat **with full memory context** — "make a video about X", "suggest topics", "upload my last video", "reply to comments" all work as plain sentences |
+
+**Agent memory (`agent_brain.py`):** SQLite database storing channel profile, custom instructions, learned facts, production history and suggestions. Every AI reply (chat, scripts, suggestions) is conditioned on this context — the more you use it, the more personalized it gets. Override location with `AGENT_MEMORY_DB`.
+
+## 🤗 Deploy on Hugging Face Spaces (Free)
+
+Full step-by-step guide in **`DEPLOY_HF_SPACE.md`**. TL;DR: create a **Docker** Space → upload the repo files → add secrets (`TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`, ..., `RUN_TELEGRAM_AGENT=true`) → set `app_port: 8501` in the Space README → the dashboard + Telegram agent run together in one free Space. Add a free UptimeRobot ping so the bot never sleeps.
+
+## 🎞️ 1080p Full HD Engine
+
+- **Smart source picking:** prefers the exact 1920×1080 rendition from Pexels, else the smallest resolution *above* 1080p (downscaling preserves sharpness), Pixabay `large` rendition as fallback
+- **Uniform render:** every clip is scale + center-cropped to 1920×1080 @ 30fps, no black bars or mixed resolutions
+- **Adaptive bitrate:** 8 Mbps for 1080p, 5 Mbps for 720p, H.264 + AAC
+- Switch resolution in the dashboard sidebar ("Video Resolution") or via the Telegram agent (always Full HD)
 
 ## 🎯 Usage
 
@@ -115,9 +199,13 @@ User Topic → [Trends API]
 ## 📦 New Files Added
 
 - `hf_engine.py` - Complete Hugging Face engine with 10+ SOTA models
-- Updated `app.py` - Hybrid AI pipeline with HF integration
-- Updated `.env.example` - Includes HF API key
-- Updated `requirements.txt` - Includes HF libraries
+- `agent_brain.py` - 🧠 Persistent agent memory (SQLite) + topic suggestion engine + intent router
+- `telegram_agent.py` - 🤖 Full Telegram AI Agent with memory (suggest/produce/upload/comments/settings)
+- `Dockerfile` + `docker-compose.yml` + `docker-entrypoint.sh` + `.dockerignore` - 🐳 Production-ready Docker / HF Space deployment
+- `DEPLOY_HF_SPACE.md` - 🤗 Free Hugging Face Spaces deployment guide
+- Updated `app.py` - Hybrid AI pipeline + 1080p Full HD render + headless YouTube OAuth
+- Updated `.env.example` - HF key + Telegram agent + Google OAuth env vars
+- Updated `requirements.txt` - Includes HF libraries + python-telegram-bot
 
 ## 🌟 Demo - What HF Adds
 

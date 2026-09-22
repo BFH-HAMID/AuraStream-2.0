@@ -1,0 +1,30 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.venv
+venv
+
+# Env & secrets (inject at runtime with --env-file / env_file)
+.env
+client_secrets.json
+
+# Rendered media & temp assets (mount a volume instead)
+temp_assets/
+*.mp4
+*.mp3
+*.wav
+*.jpg
+*.png
+
+# Docs / CI
+README.md
+LICENSE
+.github/
+Dockerfile
+docker-compose.yml

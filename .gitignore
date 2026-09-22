@@ -1,6 +1,8 @@
 # Env and secrets
 .env
 client_secrets.json
+token.pickle
+*.pickle
 
 # Temp assets
 temp_assets/
@@ -34,3 +36,4 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+.pr_body.md
