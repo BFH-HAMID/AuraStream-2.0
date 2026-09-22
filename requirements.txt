@@ -1,7 +1,7 @@
 google-genai
 edge-tts
 requests
-moviepy
+moviepy>=2.0
 whisper-timestamped
 Pillow
 google-api-python-client
@@ -9,3 +9,7 @@ google-auth-oauthlib
 google-auth-httplib2
 pytrends
 streamlit
+python-dotenv
+numpy<2.0
+imageio
+imageio-ffmpeg
