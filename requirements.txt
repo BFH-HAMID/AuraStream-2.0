@@ -13,3 +13,9 @@ python-dotenv
 numpy<2.0
 imageio
 imageio-ffmpeg
+huggingface-hub
+transformers
+torch
+torchaudio
+accelerate
+diffusers
