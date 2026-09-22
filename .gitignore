@@ -1,0 +1,36 @@
+# Env and secrets
+.env
+client_secrets.json
+
+# Temp assets
+temp_assets/
+*.mp4
+*.mp3
+*.wav
+*.jpg
+temp_*.mp3
+temp_*.wav
+temp_*.jpg
+clip_*.mp4
+main_video.mp4
+shorts_trailer.mp4
+voiceover.mp3
+thumbnail.jpg
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Streamlit
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
